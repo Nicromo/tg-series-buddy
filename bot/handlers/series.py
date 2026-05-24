@@ -236,8 +236,18 @@ def make_router(
             await bot.send_message(chat_id, f"😕 Не получилось найти: {e}")
             return
 
+        # Если поиск ничего не нашёл — пробуем нормализовать запрос через Groq
+        if not hits and groq is not None:
+            fixed = await groq.fix_query(query)
+            if fixed and fixed.lower() != query.lower():
+                await bot.send_message(chat_id, f"💡 Может, ты имел в виду <b>{fixed}</b>? Ищу…", parse_mode="HTML")
+                try:
+                    hits = await kp.search(fixed, limit=5)
+                except Exception:
+                    pass
+
         if not hits:
-            await bot.send_message(chat_id, "🤷 Ничего не нашёл. Попробуй другое название.")
+            await bot.send_message(chat_id, "🤷 Ничего не нашёл. Попробуй другое название (можно с годом или на оригинальном языке).")
             return
 
         if len(hits) == 1:

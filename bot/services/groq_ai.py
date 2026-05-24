@@ -90,6 +90,28 @@ class GroqClient:
             text = text.replace(ch, "")
         return text.strip() or None
 
+
+    async def fix_query(self, query: str) -> Optional[str]:
+        """Нормализует поисковый запрос — исправляет опечатки, дополняет.
+        Возвращает исправленное название или None если запрос и так корректный."""
+        system = (
+            "Ты - помощник поиска фильмов/сериалов. На вход - запрос пользователя "
+            "(может быть с опечатками или неполный). Если запрос явно содержит "
+            "опечатку или неполное название известного фильма/сериала - "
+            "верни ТОЛЬКО ИСПРАВЛЕННОЕ название без кавычек, без пояснений. "
+            "Если запрос корректный или сложно определить - верни ровно слово SAME."
+        )
+        try:
+            raw = (await self.chat(system, query)).strip()
+        except Exception as e:
+            logger.warning("Groq fix_query failed: %s", e)
+            return None
+        if not raw or raw.upper().startswith("SAME") or len(raw) > 80:
+            return None
+        for ch in ["\"", "'", "\u00ab", "\u00bb"]:
+            raw = raw.replace(ch, "")
+        return raw.strip() or None
+
     async def mood_search(self, mood: str, library_titles: list[str]) -> list[str]:
         """Из библиотеки юзера выбирает до 5 сериалов под запрос настроения."""
         if not library_titles:
