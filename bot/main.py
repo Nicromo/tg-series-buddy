@@ -117,6 +117,20 @@ async def main() -> None:
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.set_my_commands(BOT_COMMANDS)
         logging.info("Bot commands set: %d", len(BOT_COMMANDS))
+        # Описание бота — то что юзер видит ДО /start (в превью)
+        try:
+            await bot.set_my_short_description(short_description="Семейный учёт сериалов — для вас двоих 🛋️")
+            await bot.set_my_description(description=(
+                "🛋️ Диванные критики — семейный учёт сериалов.\n\n"
+                "• Просто пиши название (или кидай постер/голосовое) — добавлю в очередь\n"
+                "• Лайки и заметки\n"
+                "• /match — что лайкнули оба\n"
+                "• /suggest — подбор от ИИ\n"
+                "• /swipe — Tinder для сериалов\n"
+                "• Воскресенье 22:00 — спрошу про активные"
+            ))
+        except Exception as e:
+            logging.warning("set_my_description failed: %s", e)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         if ping_task:

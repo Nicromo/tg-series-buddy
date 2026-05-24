@@ -49,6 +49,9 @@ class KPDetails:
     # Трейлеры: список URL (часто YouTube), русские в приоритете
     trailers: list[str] = field(default_factory=list)
 
+    # Где смотреть: [(имя сервиса, url)]
+    watch_options: list[tuple] = field(default_factory=list)
+
     @property
     def best_trailer_youtube_id(self) -> Optional[str]:
         """Извлекаем YouTube-id из первой подходящей ссылки."""
@@ -205,6 +208,14 @@ class KinopoiskClient:
         trailers_sorted = sorted(trailers_raw, key=_trailer_score)
         trailers = [t["url"] for t in trailers_sorted if t.get("url")]
 
+        watch_options_raw = ((d.get("watchability") or {}).get("items") or [])
+        watch_options = []
+        for w in watch_options_raw[:6]:
+            name = (w.get("name") or "").strip()
+            url = (w.get("url") or "").strip()
+            if name and url:
+                watch_options.append((name, url))
+
         return KPDetails(
             kp_id=int(d["id"]),
             title_ru=d.get("name") or d.get("alternativeName") or "?",
@@ -219,4 +230,5 @@ class KinopoiskClient:
             status_kp=d.get("status"),
             is_series=bool(d.get("isSeries") or ((d.get("type") or "").lower().endswith("series"))),
             trailers=trailers,
+            watch_options=watch_options,
         )

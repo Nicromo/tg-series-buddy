@@ -50,6 +50,20 @@ class GroqClient:
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
 
+
+    async def transcribe_voice(self, audio_bytes: bytes, *, filename: str = "voice.oga") -> Optional[str]:
+        """Speech-to-text через Groq Whisper. Возвращает распознанный текст."""
+        try:
+            files = {"file": (filename, audio_bytes, "audio/ogg")}
+            data = {"model": "whisper-large-v3-turbo", "response_format": "json", "language": "ru"}
+            # httpx с multipart
+            resp = await self._client.post("/audio/transcriptions", data=data, files=files)
+            resp.raise_for_status()
+            return (resp.json().get("text") or "").strip() or None
+        except Exception as e:
+            logger.warning("Whisper failed: %s", e)
+            return None
+
     async def vision_recognize_series(self, image_bytes: bytes) -> Optional[str]:
         b64 = base64.b64encode(image_bytes).decode("ascii")
         payload = {

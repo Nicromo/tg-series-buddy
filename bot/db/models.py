@@ -68,6 +68,8 @@ class Series(Base):
     trailer_youtube_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     trailer_file_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     trailer_language: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    # JSON список [{name, url}] — где смотреть
+    watch_options_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     added_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
 

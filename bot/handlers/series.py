@@ -111,6 +111,17 @@ def _format_caption(s: Series, *, status: Optional[str] = None, rating: Optional
         lines.append("")
         lines.append("• " + " • ".join(pinned))
 
+    # Где смотреть
+    if getattr(s, "watch_options_json", None):
+        try:
+            opts = __import__("json").loads(s.watch_options_json)
+        except Exception:
+            opts = []
+        if opts:
+            wl = ", ".join(f'<a href="{u}">{n}</a>' for n, u in opts[:5])
+            lines.append("")
+            lines.append(f"📺 Смотреть: {wl}")
+
     if note:
         lines.append(f"\n📝 <i>{note}</i>")
 
@@ -163,6 +174,7 @@ def _details_to_series_dict(d: KPDetails) -> dict:
         "status_kp": d.status_kp,
         "trailer_youtube_id": d.best_trailer_youtube_id,
         "trailer_language": "ru" if d.trailers else None,
+        "watch_options_json": __import__("json").dumps(d.watch_options) if d.watch_options else None,
     }
 
 
@@ -196,6 +208,29 @@ def make_router(
             "Или просто пришли скрин с постером — распознаю 📸",
             parse_mode="HTML",
         )
+
+
+    # ============== Voice сообщение → Whisper → поиск ==============
+    @router.message(F.voice)
+    async def on_voice(message: Message, state: FSMContext) -> None:
+        if not groq:
+            await message.answer("🎤 Голосовой поиск недоступен — нет GROQ_API_KEY")
+            return
+        await message.bot.send_chat_action(message.chat.id, action="typing")
+        try:
+            buf = io.BytesIO()
+            await message.bot.download(message.voice, destination=buf)
+            buf.seek(0)
+            text = await groq.transcribe_voice(buf.read())
+        except Exception as e:
+            logger.exception("Voice transcribe crashed")
+            await message.answer(f"😕 Не получилось распознать: {e}")
+            return
+        if not text:
+            await message.answer("🤔 Не расслышал. Попробуй ещё раз или напиши текстом.")
+            return
+        await message.answer(f"🎤 Услышал: <b>{text}</b>\nИщу…", parse_mode="HTML")
+        await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, text, state=state)
 
     # ============== Photo → распознавание через Groq vision ==============
     @router.message(F.photo)
@@ -712,9 +747,32 @@ def make_router(
         if not matches:
             await message.answer("💛 Пока нет общих лайков. Лайкайте сериалы — будет!")
             return
-        await message.answer(f"💛 <b>Лайкнули оба ({len(matches)}):</b>", parse_mode="HTML")
-        for series in matches[:15]:
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        await message.answer(
+            f"💛 <b>Лайкнули оба ({len(matches)}):</b>",
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=[[IKB(text="🎲 Случайный из общих", callback_data="match_random:0")]]),
+        )
+        for series in matches[:10]:
             await _send_card(message.bot, message.chat.id, series)
+
+    @router.callback_query(F.data.startswith("match_random:"))
+    async def cb_match_random(call: CallbackQuery) -> None:
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            if not user.pair_id:
+                await call.answer("Нет пары")
+                return
+            matches = await repo.list_pair_matches(session, user.pair_id)
+        if not matches:
+            await call.answer("Нет общих лайков")
+            return
+        s = random.choice(matches)
+        await call.answer("Включаем! 🎬")
+        await _send_card(call.bot, call.message.chat.id, s)
 
     @router.message(F.text == "💛 Лайки оба")
     async def btn_match(message: Message) -> None:
