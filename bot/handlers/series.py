@@ -1,15 +1,17 @@
-"""Handlers: /add, /list, /watching, /watched, /rewatch, /random, /match, /checkin
-and all callback buttons. Data source: kinopoisk.dev.
-"""
+"""Хендлеры команд, callback-кнопок, кнопок главного меню и фото."""
 
 from __future__ import annotations
 
+import io
 import logging
 import random
+from collections import Counter
 from typing import Optional
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -19,13 +21,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ..config import Settings
 from ..db import repository as repo
-from ..db.models import Series
+from ..db.models import Series, UserSeries
 from ..keyboards.series_kb import (
     card_keyboard,
     checkin_keyboard,
     rating_only_keyboard,
     search_results_keyboard,
+    swipe_keyboard,
 )
+from ..services.groq_ai import GroqClient
 from ..services.kinopoisk import KinopoiskClient, KPDetails
 from ..services.scheduler import run_weekly_checkin
 from ..services.trailer import fetch_best_trailer
@@ -35,15 +39,27 @@ logger = logging.getLogger(__name__)
 STATUS_LABELS = {
     "want": "👀 Хочу посмотреть",
     "watching": "▶️ Смотрю",
-    "watched": "✅ Посмотрел",
+    "watched": "✅ Досмотрел",
     "want_rewatch": "🔁 Хочу пересмотреть",
     "dropped": "❌ Дропнул",
 }
-
 RATING_LABELS = {"like": "👍 Лайк", "dislike": "👎 Дизлайк"}
 
 
-def _format_caption(s: Series, *, status: Optional[str] = None, rating: Optional[str] = None) -> str:
+class NoteFSM(StatesGroup):
+    waiting = State()
+
+
+class SwipeFSM(StatesGroup):
+    swiping = State()
+
+
+class PickFSM(StatesGroup):
+    """Ожидание выбора варианта (цифрой или кнопкой) после /add или фото."""
+    choosing = State()
+
+
+def _format_caption(s: Series, *, status: Optional[str] = None, rating: Optional[str] = None, note: Optional[str] = None) -> str:
     lines: list[str] = []
     title = f"🎬 <b>{s.title_ru}</b>"
     if s.title_en and s.title_en != s.title_ru:
@@ -73,8 +89,8 @@ def _format_caption(s: Series, *, status: Optional[str] = None, rating: Optional
 
     if s.description_ru:
         desc = s.description_ru
-        if len(desc) > 600:
-            desc = desc[:600].rstrip() + "…"
+        if len(desc) > 500:
+            desc = desc[:500].rstrip() + "…"
         lines.append("")
         lines.append(desc)
 
@@ -87,6 +103,9 @@ def _format_caption(s: Series, *, status: Optional[str] = None, rating: Optional
         lines.append("")
         lines.append("• " + " • ".join(pinned))
 
+    if note:
+        lines.append(f"\n📝 <i>{note}</i>")
+
     return "\n".join(lines)
 
 
@@ -97,15 +116,15 @@ async def _send_card(
     *,
     user_status: Optional[str] = None,
     user_rating: Optional[str] = None,
+    note: Optional[str] = None,
 ) -> None:
-    caption = _format_caption(series, status=user_status, rating=user_rating)
+    caption = _format_caption(series, status=user_status, rating=user_rating, note=note)
     is_watched = user_status == "watched"
     kb = card_keyboard(
         series.id,
         has_trailer=bool(series.trailer_youtube_id or series.trailer_file_id),
         is_watched=is_watched,
     )
-
     if series.poster_url:
         try:
             await bot.send_photo(
@@ -118,13 +137,7 @@ async def _send_card(
             return
         except Exception as e:
             logger.warning("send_photo failed: %s — falling back to text", e)
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text=caption,
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
+    await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", reply_markup=kb)
 
 
 def _details_to_series_dict(d: KPDetails) -> dict:
@@ -149,55 +162,149 @@ def make_router(
     session_factory: async_sessionmaker,
     kp: KinopoiskClient,
     settings: Settings,
+    groq: Optional[GroqClient] = None,
 ) -> Router:
     router = Router(name="series")
 
+    # ============== /add and КNopкa "🎬 Добавить" ==============
     @router.message(Command("add"))
-    async def cmd_add(message: Message) -> None:
+    async def cmd_add(message: Message, state: FSMContext) -> None:
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("Напиши: <code>/add Severance</code>", parse_mode="HTML")
+            await message.answer(
+                "📝 Напиши название сериала после команды:\n"
+                "<code>/add Severance</code>\n\n"
+                "Или просто пришли скрин/постер — распознаю 📸",
+                parse_mode="HTML",
+            )
             return
-        query = parts[1].strip()
+        await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, parts[1].strip(), state=state)
 
+    @router.message(F.text == "🎬 Добавить")
+    async def btn_add(message: Message) -> None:
+        await message.answer(
+            "🎬 <b>Добавить сериал</b>\n\n"
+            "Напиши название после команды <code>/add Severance</code>\n"
+            "Или просто пришли скрин с постером — распознаю 📸",
+            parse_mode="HTML",
+        )
+
+    # ============== Photo → распознавание через Groq vision ==============
+    @router.message(F.photo)
+    async def on_photo(message: Message, state: FSMContext) -> None:
+        if not groq:
+            await message.answer(
+                "📸 Распознавание скринов недоступно — не задан GROQ_API_KEY.\n"
+                "Пока напиши название текстом: /add Severance"
+            )
+            return
         await message.bot.send_chat_action(message.chat.id, action="typing")
+        try:
+            # Берём самое большое разрешение
+            biggest = message.photo[-1]
+            buf = io.BytesIO()
+            await message.bot.download(biggest, destination=buf)
+            buf.seek(0)
+            title = await groq.vision_recognize_series(buf.read())
+        except Exception as e:
+            logger.exception("Vision recognize crashed")
+            await message.answer(f"😕 Не получилось обработать картинку: {e}")
+            return
+
+        if not title:
+            await message.answer(
+                "🤔 На картинке не вижу название сериала. "
+                "Пришли постер поярче или напиши вручную: <code>/add название</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        await message.answer(f"🔎 Распознал: <b>{title}</b>\nИщу в Кинопоиске…", parse_mode="HTML")
+        await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, title, state=state)
+
+    async def _do_search_and_show(bot: Bot, chat_id: int, tg_user_id: int, query: str, *, state: Optional[FSMContext] = None) -> None:
+        await bot.send_chat_action(chat_id, action="typing")
         try:
             hits = await kp.search(query, limit=5)
         except Exception as e:
             logger.exception("KP search failed")
-            await message.answer(f"😕 Не получилось найти: {e}")
+            await bot.send_message(chat_id, f"😕 Не получилось найти: {e}")
             return
 
         if not hits:
-            await message.answer("Ничего не нашёл (или это не сериал). Попробуй другое название.")
+            await bot.send_message(chat_id, "🤷 Ничего не нашёл. Попробуй другое название.")
             return
 
         if len(hits) == 1:
-            await _add_by_kp_id(
-                message.bot, message.chat.id, message.from_user.id, hits[0].kp_id, session_factory, kp
-            )
+            await _add_by_kp_id(bot, chat_id, tg_user_id, hits[0].kp_id, session_factory, kp)
             return
 
-        kb_items = []
-        for h in hits:
-            label = h.title_ru + (f" ({h.year})" if h.year else "")
-            kb_items.append((h.kp_id, label))
-        await message.answer(
-            "Нашёл несколько вариантов — выбери:",
+        # Показываем по одному варианту с постером + ссылкой на Кинопоиск
+        digits = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        await bot.send_message(chat_id, f"🤔 <b>Вы имеете в виду:</b>", parse_mode="HTML")
+        for i, h in enumerate(hits[:10]):
+            prefix = digits[i] if i < len(digits) else f"{i+1}."
+            kp_url = f"https://www.kinopoisk.ru/series/{h.kp_id}/"
+            cap_lines = [f"{prefix} <b>{h.title_ru}</b>"]
+            if h.title_en and h.title_en != h.title_ru:
+                cap_lines[0] += f" / <i>{h.title_en}</i>"
+            if h.year:
+                cap_lines[0] += f" ({h.year})"
+            if h.rating_kp:
+                cap_lines.append(f"⭐ КП {h.rating_kp:.1f}")
+            if h.short_description:
+                short = h.short_description if len(h.short_description) <= 200 else h.short_description[:200].rstrip() + "…"
+                cap_lines.append(short)
+            cap_lines.append(f'<a href="{kp_url}">Открыть на Кинопоиске</a>')
+            caption = "\n".join(cap_lines)
+            if h.poster_url:
+                try:
+                    await bot.send_photo(chat_id=chat_id, photo=h.poster_url, caption=caption, parse_mode="HTML")
+                    continue
+                except Exception:
+                    pass
+            await bot.send_message(chat_id, caption, parse_mode="HTML", disable_web_page_preview=False)
+
+        # Клавиатура для выбора цифрой
+        kb_items = [(h.kp_id, h.title_ru + (f" ({h.year})" if h.year else "")) for h in hits]
+        await bot.send_message(
+            chat_id,
+            "👇 Какой из них? (или напиши номер цифрой)",
             reply_markup=search_results_keyboard(kb_items),
         )
+        # FSM: запомним список и ждём цифру
+        if state is not None:
+            await state.update_data(pick_hits=[h.kp_id for h in hits])
+            await state.set_state(PickFSM.choosing)
 
     @router.callback_query(F.data.startswith("pick:"))
-    async def cb_pick(call: CallbackQuery) -> None:
+    async def cb_pick(call: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
         kp_id = int(call.data.split(":")[1])
-        await call.answer("Загружаю детали…")
-        await _add_by_kp_id(
-            call.bot, call.message.chat.id, call.from_user.id, kp_id, session_factory, kp
-        )
+        await call.answer("Загружаю…")
+        await _add_by_kp_id(call.bot, call.message.chat.id, call.from_user.id, kp_id, session_factory, kp)
         try:
             await call.message.delete()
         except Exception:
             pass
+
+    # ============== Статусы (st:) — с обязательной оценкой для watched ==============
+
+    @router.message(PickFSM.choosing, Command("cancel"))
+    async def pick_cancel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer("Отменил.")
+
+    @router.message(PickFSM.choosing, F.text.regexp(r"^\d+$"))
+    async def pick_by_number(message: Message, state: FSMContext) -> None:
+        n = int(message.text.strip())
+        data = await state.get_data()
+        hits: list[int] = data.get("pick_hits", [])
+        if not hits or n < 1 or n > len(hits):
+            await message.answer(f"Номер от 1 до {len(hits)}.")
+            return
+        await state.clear()
+        await _add_by_kp_id(message.bot, message.chat.id, message.from_user.id, hits[n - 1], session_factory, kp)
 
     @router.callback_query(F.data.startswith("st:"))
     async def cb_status(call: CallbackQuery) -> None:
@@ -210,9 +317,20 @@ def make_router(
                 username=call.from_user.username,
                 full_name=call.from_user.full_name,
             )
-            await repo.set_user_series_status(session, call.from_user.id, series_id, status)
+            us = await repo.set_user_series_status(session, call.from_user.id, series_id, status)
             await session.commit()
-        await call.answer(f"Ок: {STATUS_LABELS.get(status, status)}")
+
+            # Если только что отметили "досмотрел" и нет оценки — попросим
+            if status == "watched" and not us.rating:
+                series = await session.get(Series, series_id)
+                title = series.title_ru if series else "сериал"
+                await call.message.answer(
+                    f"🎯 <b>{title}</b> — досмотрено! Поставь оценку:",
+                    parse_mode="HTML",
+                    reply_markup=rating_only_keyboard(series_id),
+                )
+
+        await call.answer(f"✅ {STATUS_LABELS.get(status, status)}")
 
     @router.callback_query(F.data.startswith("rt:"))
     async def cb_rating(call: CallbackQuery) -> None:
@@ -227,16 +345,14 @@ def make_router(
             )
             await repo.set_user_series_rating(session, call.from_user.id, series_id, rating)
             await session.commit()
-        await call.answer(f"Ок: {RATING_LABELS.get(rating, rating)}")
+        await call.answer(f"Принято: {RATING_LABELS.get(rating, rating)}")
 
+    # ============== Weekly check-in (ck:) ==============
     @router.callback_query(F.data.startswith("ck:"))
     async def cb_checkin(call: CallbackQuery) -> None:
-        """Weekly check-in: 'finished / still watching / dropped'."""
         _, action, series_id_s = call.data.split(":")
         series_id = int(series_id_s)
-
         if action == "fin":
-            # Mark as watched
             async with session_factory() as session:
                 await repo.get_or_create_user(
                     session,
@@ -246,22 +362,20 @@ def make_router(
                 )
                 us = await repo.set_user_series_status(session, call.from_user.id, series_id, "watched")
                 await session.commit()
-                # If no rating yet -- ask for it
                 if not us.rating:
                     series = await session.get(Series, series_id)
                     title = series.title_ru if series else "сериал"
                     await call.message.answer(
-                        f"Поставь оценку <b>{title}</b>:",
+                        f"🎯 <b>{title}</b> — досмотрено! Поставь оценку:",
                         parse_mode="HTML",
                         reply_markup=rating_only_keyboard(series_id),
                     )
-            await call.answer("Ок: ✅ Досмотрел")
+            await call.answer("✅ Досмотрел")
         elif action == "cont":
-            # Still watching -- just record the check-in
             async with session_factory() as session:
                 await repo.mark_checkin_sent(session, call.from_user.id, series_id)
                 await session.commit()
-            await call.answer("Ок: ▶️ Спрошу через неделю")
+            await call.answer("▶️ Спрошу через неделю")
         elif action == "drop":
             async with session_factory() as session:
                 await repo.get_or_create_user(
@@ -272,8 +386,9 @@ def make_router(
                 )
                 await repo.set_user_series_status(session, call.from_user.id, series_id, "dropped")
                 await session.commit()
-            await call.answer("Ок: ❌ Дропнул")
+            await call.answer("❌ Дропнул")
 
+    # ============== Трейлер ==============
     @router.callback_query(F.data.startswith("tr:"))
     async def cb_trailer(call: CallbackQuery) -> None:
         series_id = int(call.data.split(":")[1])
@@ -284,7 +399,6 @@ def make_router(
             if series is None:
                 await call.message.answer("Не нашёл сериал в БД.")
                 return
-
             if series.trailer_file_id:
                 try:
                     await call.bot.send_video(
@@ -294,10 +408,9 @@ def make_router(
                     )
                     return
                 except Exception as e:
-                    logger.warning("Cached file_id failed, will re-download: %s", e)
+                    logger.warning("Cached file_id failed: %s", e)
                     series.trailer_file_id = None
                     await session.flush()
-
             yt_id = series.trailer_youtube_id
             title = series.title_ru
             year = series.year
@@ -312,16 +425,14 @@ def make_router(
             out_dir=settings.trailer_tmp_dir,
             max_mb=settings.max_trailer_mb,
         )
-
         if path is None:
             await call.message.answer("😕 Не получилось скачать трейлер.")
             return
-
         try:
             msg = await call.bot.send_video(
                 chat_id=call.message.chat.id,
                 video=FSInputFile(path),
-                caption=f"🎥 Трейлер · {title} · источник: {source}",
+                caption=f"🎥 Трейлер · {title} · {source}",
                 supports_streaming=True,
             )
             if msg.video and msg.video.file_id:
@@ -331,7 +442,7 @@ def make_router(
                         series.trailer_file_id = msg.video.file_id
                         await session.commit()
         except Exception as e:
-            logger.exception("Failed to send video")
+            logger.exception("send_video failed")
             await call.message.answer(f"😕 Telegram отказался: {e}")
         finally:
             try:
@@ -339,37 +450,101 @@ def make_router(
             except Exception:
                 pass
 
-    async def _send_list(message: Message, status: str, empty_msg: str) -> None:
+    # ============== Заметки (note:) — FSM ==============
+    @router.callback_query(F.data.startswith("note:"))
+    async def cb_note(call: CallbackQuery, state: FSMContext) -> None:
+        series_id = int(call.data.split(":")[1])
+        async with session_factory() as session:
+            series = await session.get(Series, series_id)
+            title = series.title_ru if series else "сериал"
+        await state.update_data(series_id=series_id)
+        await state.set_state(NoteFSM.waiting)
+        await call.message.answer(
+            f"📝 Напиши заметку про <b>{title}</b> (или /cancel чтобы отменить):",
+            parse_mode="HTML",
+        )
+        await call.answer()
+
+    @router.message(NoteFSM.waiting, Command("cancel"))
+    async def note_cancel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer("Отменил.")
+
+    @router.message(NoteFSM.waiting)
+    async def note_save(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        series_id = data.get("series_id")
+        text = (message.text or "").strip()[:500]
+        async with session_factory() as session:
+            us = await repo.get_user_series(session, message.from_user.id, series_id)
+            if us is None:
+                us = await repo.set_user_series_status(session, message.from_user.id, series_id, "want")
+            us.notes = text
+            await session.commit()
+        await state.clear()
+        await message.answer(f"✅ Заметка сохранена: <i>{text}</i>", parse_mode="HTML")
+
+    # ============== Поделиться (share:) ==============
+    @router.callback_query(F.data.startswith("share:"))
+    async def cb_share(call: CallbackQuery) -> None:
+        series_id = int(call.data.split(":")[1])
+        bot_user = await call.bot.me()
+        link = f"https://t.me/{bot_user.username}?start=show_{series_id}"
+        await call.message.answer(
+            f"📤 Перешли эту ссылку партнёру или другу:\n{link}",
+            disable_web_page_preview=True,
+        )
+        await call.answer()
+
+    # ============== Списки с пагинацией ==============
+    async def _send_list(message: Message, status: str, empty_msg: str, *, header: str = "") -> None:
         async with session_factory() as session:
             rows = await repo.list_user_series(session, message.from_user.id, status=status)
         if not rows:
             await message.answer(empty_msg)
             return
-        for us, series in rows[:20]:
+        if header:
+            await message.answer(header, parse_mode="HTML")
+        for us, series in rows[:15]:
             await _send_card(
-                message.bot,
-                message.chat.id,
-                series,
-                user_status=us.status,
-                user_rating=us.rating,
+                message.bot, message.chat.id, series,
+                user_status=us.status, user_rating=us.rating, note=us.notes,
             )
 
     @router.message(Command("list"))
     async def cmd_list(message: Message) -> None:
-        await _send_list(message, "want", "Очередь пустая. Добавь /add &lt;название&gt;")
+        await _send_list(message, "want", "Очередь пустая. Добавь /add &lt;название&gt;", header="👀 <b>Хочу посмотреть:</b>")
 
     @router.message(Command("watching"))
     async def cmd_watching(message: Message) -> None:
-        await _send_list(message, "watching", "Сейчас ничего не смотришь.")
+        await _send_list(message, "watching", "Сейчас ничего не смотришь.", header="▶️ <b>Смотрим сейчас:</b>")
 
     @router.message(Command("watched"))
     async def cmd_watched(message: Message) -> None:
-        await _send_list(message, "watched", "Ещё ничего не досмотрел до конца.")
+        await _send_list(message, "watched", "Ещё ничего не досмотрел до конца.", header="✅ <b>Досмотрено:</b>")
 
     @router.message(Command("rewatch"))
     async def cmd_rewatch(message: Message) -> None:
-        await _send_list(message, "want_rewatch", "Список пересмотра пустой. Жми 🔁 в карточке досмотренного сериала.")
+        await _send_list(message, "want_rewatch", "Список пересмотра пуст. Жми 🔁 в карточке досмотренного сериала.", header="🔁 <b>Пересмотреть:</b>")
 
+    # Кнопки главного меню
+    @router.message(F.text == "👀 Хочу")
+    async def btn_want(message: Message) -> None:
+        await cmd_list(message)
+
+    @router.message(F.text == "▶️ Смотрю")
+    async def btn_watching(message: Message) -> None:
+        await cmd_watching(message)
+
+    @router.message(F.text == "✅ Посмотрел")
+    async def btn_watched(message: Message) -> None:
+        await cmd_watched(message)
+
+    @router.message(F.text == "🔁 Пересмотреть")
+    async def btn_rewatch(message: Message) -> None:
+        await cmd_rewatch(message)
+
+    # ============== /random + /today ==============
     @router.message(Command("random"))
     async def cmd_random(message: Message) -> None:
         async with session_factory() as session:
@@ -378,36 +553,230 @@ def make_router(
             await message.answer("Очередь пустая.")
             return
         us, series = random.choice(rows)
-        await _send_card(message.bot, message.chat.id, series, user_status=us.status, user_rating=us.rating)
+        await message.answer("🎲 А давай вот это:", parse_mode="HTML")
+        await _send_card(message.bot, message.chat.id, series, user_status=us.status, user_rating=us.rating, note=us.notes)
 
+    @router.message(Command("today"))
+    async def cmd_today(message: Message) -> None:
+        """Что включить сегодня. Логика: сначала watching, потом want, потом rewatch."""
+        async with session_factory() as session:
+            for status, label in [("watching", "Ты ведь это смотришь"), ("want", "Из очереди"), ("want_rewatch", "Из пересмотра")]:
+                rows = await repo.list_user_series(session, message.from_user.id, status=status)
+                if rows:
+                    us, series = random.choice(rows)
+                    await message.answer(f"🍿 <b>{label}:</b>", parse_mode="HTML")
+                    await _send_card(message.bot, message.chat.id, series, user_status=us.status, user_rating=us.rating, note=us.notes)
+                    return
+        await message.answer("📭 Список пуст. Добавь хоть один сериал через /add 🎬")
+
+    @router.message(F.text == "🎲 Что включить?")
+    async def btn_today(message: Message) -> None:
+        await cmd_today(message)
+
+    # ============== /find — поиск в своих ==============
+    @router.message(Command("find"))
+    async def cmd_find(message: Message) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer("🔎 Напиши: <code>/find дарк</code>", parse_mode="HTML")
+            return
+        query = parts[1].strip().lower()
+        async with session_factory() as session:
+            rows = await repo.list_user_series(session, message.from_user.id, status=None)
+        matched = [
+            (us, series) for us, series in rows
+            if query in (series.title_ru or "").lower() or query in (series.title_en or "").lower()
+        ]
+        if not matched:
+            await message.answer(f"Ничего не нашёл по «{query}».")
+            return
+        await message.answer(f"🔎 Нашёл ({len(matched)}):", parse_mode="HTML")
+        for us, series in matched[:10]:
+            await _send_card(message.bot, message.chat.id, series, user_status=us.status, user_rating=us.rating, note=us.notes)
+
+    # ============== /match ==============
     @router.message(Command("match"))
     async def cmd_match(message: Message) -> None:
         async with session_factory() as session:
             user = await repo.get_or_create_user(
-                session,
-                tg_id=message.from_user.id,
-                username=message.from_user.username,
-                full_name=message.from_user.full_name,
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
             )
             if not user.pair_id:
-                await message.answer("Сначала свяжись с партнёром через /pair — иначе не с кем мэтчиться 🙂")
+                await message.answer("👫 Сначала свяжись с партнёром через /pair")
                 return
             matches = await repo.list_pair_matches(session, user.pair_id)
         if not matches:
-            await message.answer("Пока нет общих лайков. Лайкайте сериалы — будет 💛")
+            await message.answer("💛 Пока нет общих лайков. Лайкайте сериалы — будет!")
             return
-        await message.answer(f"💛 Лайкнули оба ({len(matches)}):")
-        for series in matches[:20]:
+        await message.answer(f"💛 <b>Лайкнули оба ({len(matches)}):</b>", parse_mode="HTML")
+        for series in matches[:15]:
             await _send_card(message.bot, message.chat.id, series)
 
+    @router.message(F.text == "💛 Лайки оба")
+    async def btn_match(message: Message) -> None:
+        await cmd_match(message)
+
+    # ============== /stats ==============
+    @router.message(Command("stats"))
+    async def cmd_stats(message: Message) -> None:
+        async with session_factory() as session:
+            all_rows = await repo.list_user_series(session, message.from_user.id, status=None)
+        if not all_rows:
+            await message.answer("📊 Пока пусто. Добавь что-нибудь через /add 🎬")
+            return
+        st_count = Counter(us.status for us, _ in all_rows)
+        likes = sum(1 for us, _ in all_rows if us.rating == "like")
+        dislikes = sum(1 for us, _ in all_rows if us.rating == "dislike")
+        genre_counter: Counter = Counter()
+        for us, s in all_rows:
+            if us.rating == "like" and s.genres:
+                for g in s.genres.split(","):
+                    g = g.strip()
+                    if g:
+                        genre_counter[g] += 1
+        top_genres = ", ".join(g for g, _ in genre_counter.most_common(3)) or "—"
+        text = (
+            "📊 <b>Твоя статистика</b>\n\n"
+            f"📺 Всего сериалов: <b>{len(all_rows)}</b>\n"
+            f"👀 Хочу: {st_count.get('want', 0)}\n"
+            f"▶️ Смотрю: {st_count.get('watching', 0)}\n"
+            f"✅ Досмотрел: {st_count.get('watched', 0)}\n"
+            f"🔁 Пересмотр: {st_count.get('want_rewatch', 0)}\n"
+            f"❌ Дропнул: {st_count.get('dropped', 0)}\n\n"
+            f"👍 Лайков: {likes}  ·  👎 Дизлайков: {dislikes}\n"
+            f"🎭 Топ жанры: <i>{top_genres}</i>"
+        )
+        await message.answer(text, parse_mode="HTML")
+
+    @router.message(F.text == "📊 Статистика")
+    async def btn_stats(message: Message) -> None:
+        await cmd_stats(message)
+
+    # ============== /suggest — Groq AI рекомендации ==============
+    @router.message(Command("suggest"))
+    async def cmd_suggest(message: Message) -> None:
+        if not groq:
+            await message.answer("🤖 Подбор от ИИ недоступен — нет GROQ_API_KEY")
+            return
+        await message.bot.send_chat_action(message.chat.id, action="typing")
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            partner_ids: list[int] = []
+            if user.pair_id:
+                members = await repo.get_pair_members(session, user.pair_id)
+                partner_ids = [m.id for m in members if m.id != user.id]
+
+            my_rows = await repo.list_user_series(session, user.id, status=None)
+            partner_rows: list = []
+            if partner_ids:
+                partner_rows = await repo.list_user_series(session, partner_ids[0], status=None)
+
+        likes_a = [s.title_ru for us, s in my_rows if us.rating == "like"]
+        dislikes_a = [s.title_ru for us, s in my_rows if us.rating == "dislike"]
+        likes_b = [s.title_ru for us, s in partner_rows if us.rating == "like"]
+        dislikes_b = [s.title_ru for us, s in partner_rows if us.rating == "dislike"]
+        queue = [s.title_ru for us, s in my_rows if us.status in ("want", "watching")]
+
+        try:
+            suggestions = await groq.suggest_for_pair(
+                likes_a=likes_a, likes_b=likes_b,
+                dislikes_a=dislikes_a, dislikes_b=dislikes_b,
+                already_in_queue=queue,
+            )
+        except Exception as e:
+            logger.exception("Groq suggest failed")
+            await message.answer(f"😕 ИИ заглох: {e}")
+            return
+
+        if not suggestions:
+            await message.answer("🤔 Не получилось придумать. Попробуй позже.")
+            return
+
+        await message.answer(f"✨ <b>Идеи от ИИ ({len(suggestions)}):</b>", parse_mode="HTML")
+        for sug in suggestions:
+            txt = f"🎬 <b>{sug.title}</b>"
+            if sug.year:
+                txt += f" ({sug.year})"
+            if sug.why:
+                txt += f"\n💡 <i>{sug.why}</i>"
+            txt += f"\n\nДобавить? <code>/add {sug.title}</code>"
+            await message.answer(txt, parse_mode="HTML")
+
+    @router.message(F.text == "✨ Подобрать")
+    async def btn_suggest(message: Message) -> None:
+        await cmd_suggest(message)
+
+    # ============== /swipe — игровой режим ==============
+    @router.message(Command("swipe"))
+    async def cmd_swipe(message: Message, state: FSMContext) -> None:
+        async with session_factory() as session:
+            rows = await repo.list_user_series(session, message.from_user.id, status="want")
+        if not rows:
+            await message.answer("🃏 Очередь пустая — нечего свайпать.")
+            return
+        random.shuffle(rows)
+        queue = [(us.series_id, s.title_ru) for us, s in rows[:10]]
+        await state.update_data(queue=queue, idx=0)
+        await state.set_state(SwipeFSM.swiping)
+        await message.answer(f"🎮 <b>Свайп-вечер</b>\n\nПокажу {len(queue)} сериалов. ❤️ — хочу включить, 👎 — пропустить.", parse_mode="HTML")
+        await _send_swipe_card(message.bot, message.chat.id, queue[0][0], 0, session_factory)
+
+    @router.callback_query(SwipeFSM.swiping, F.data.startswith("sw:"))
+    async def cb_swipe(call: CallbackQuery, state: FSMContext) -> None:
+        _, action, series_id_s, queue_idx_s = call.data.split(":")
+        queue_idx = int(queue_idx_s)
+        data = await state.get_data()
+        queue: list = data.get("queue", [])
+        if action == "stop":
+            await state.clear()
+            await call.message.answer("🏁 Свайп окончен.")
+            await call.answer()
+            return
+        if action == "yes":
+            series_id = int(series_id_s)
+            async with session_factory() as session:
+                await repo.set_user_series_rating(session, call.from_user.id, series_id, "like")
+                await session.commit()
+            await call.answer("❤️ Лайк!")
+        else:
+            await call.answer("👎 Скип")
+        next_idx = queue_idx + 1
+        if next_idx >= len(queue):
+            await state.clear()
+            await call.message.answer("🏁 Все варианты показал! Глянь /match — может, что-то совпало.")
+            return
+        await state.update_data(idx=next_idx)
+        await _send_swipe_card(call.bot, call.message.chat.id, queue[next_idx][0], next_idx, session_factory)
+
+    async def _send_swipe_card(bot: Bot, chat_id: int, series_id: int, idx: int, sf: async_sessionmaker) -> None:
+        async with sf() as session:
+            series = await session.get(Series, series_id)
+            if series is None:
+                return
+        caption = f"#{idx + 1} · {_format_caption(series)}"
+        kb = swipe_keyboard(series_id, idx)
+        if series.poster_url:
+            try:
+                await bot.send_photo(chat_id=chat_id, photo=series.poster_url, caption=caption, parse_mode="HTML", reply_markup=kb)
+                return
+            except Exception:
+                pass
+        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=kb)
+
+    # ============== /checkin manual ==============
     @router.message(Command("checkin"))
     async def cmd_checkin_manual(message: Message) -> None:
-        """Manually trigger the weekly check-in (for testing / on-demand)."""
         sent = await run_weekly_checkin(message.bot, session_factory)
         await message.answer(f"🔔 Опрос отправлен: {sent} сериал(ов).")
 
     return router
 
+
+# ---------- Helper ----------
 
 async def _add_by_kp_id(
     bot: Bot,
@@ -423,11 +792,13 @@ async def _add_by_kp_id(
         logger.exception("KP details failed")
         await bot.send_message(chat_id, f"😕 Не получилось загрузить детали: {e}")
         return
-
     async with session_factory() as session:
         await repo.get_or_create_user(session, tg_id=tg_user_id, username=None, full_name=None)
         await repo.upsert_series_from_dict(session, _details_to_series_dict(details))
         await session.commit()
         series = await repo.get_series_by_kp_id(session, details.kp_id)
-
-    await _send_card(bot, chat_id, series)
+        us = await repo.get_user_series(session, tg_user_id, series.id)
+        status = us.status if us else None
+        rating = us.rating if us else None
+        note = us.notes if us else None
+    await _send_card(bot, chat_id, series, user_status=status, user_rating=rating, note=note)

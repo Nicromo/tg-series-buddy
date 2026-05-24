@@ -1,4 +1,4 @@
-"""Inline keyboards for series cards."""
+"""Инлайн-клавиатуры для карточек сериалов."""
 
 from __future__ import annotations
 
@@ -11,11 +11,6 @@ def card_keyboard(
     has_trailer: bool,
     is_watched: bool = False,
 ) -> InlineKeyboardMarkup:
-    """Buttons under series card.
-
-    For 'watched' series we add a single 'Хочу пересмотреть' button
-    instead of the regular status row (the series is already finished).
-    """
     rows: list[list[InlineKeyboardButton]] = []
 
     if is_watched:
@@ -31,15 +26,17 @@ def card_keyboard(
         )
         rows.append(
             [
-                InlineKeyboardButton(text="✅ Посмотрел", callback_data=f"st:watched:{series_id}"),
+                InlineKeyboardButton(text="✅ Досмотрел", callback_data=f"st:watched:{series_id}"),
                 InlineKeyboardButton(text="❌ Дропнул", callback_data=f"st:dropped:{series_id}"),
             ]
         )
 
     rows.append(
         [
-            InlineKeyboardButton(text="👍 Лайк", callback_data=f"rt:like:{series_id}"),
-            InlineKeyboardButton(text="👎 Дизлайк", callback_data=f"rt:dislike:{series_id}"),
+            InlineKeyboardButton(text="👍", callback_data=f"rt:like:{series_id}"),
+            InlineKeyboardButton(text="👎", callback_data=f"rt:dislike:{series_id}"),
+            InlineKeyboardButton(text="📝", callback_data=f"note:{series_id}"),
+            InlineKeyboardButton(text="📤", callback_data=f"share:{series_id}"),
         ]
     )
 
@@ -51,15 +48,16 @@ def card_keyboard(
 
 
 def search_results_keyboard(hits: list[tuple[int, str]]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=label, callback_data=f"pick:{kp_id}")]
-        for kp_id, label in hits
-    ]
+    """Кнопки выбора варианта поиска: '1️⃣ Название (2020)'."""
+    digits = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    rows = []
+    for i, (kp_id, label) in enumerate(hits[:10]):
+        prefix = digits[i] if i < len(digits) else f"{i+1}."
+        rows.append([InlineKeyboardButton(text=f"{prefix} {label}", callback_data=f"pick:{kp_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def checkin_keyboard(series_id: int) -> InlineKeyboardMarkup:
-    """Weekly check-in keyboard: 'finished / still watching / dropped'."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -72,12 +70,24 @@ def checkin_keyboard(series_id: int) -> InlineKeyboardMarkup:
 
 
 def rating_only_keyboard(series_id: int) -> InlineKeyboardMarkup:
-    """After 'finished' check-in -- ask for rating if not yet set."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="👍 Лайк", callback_data=f"rt:like:{series_id}"),
                 InlineKeyboardButton(text="👎 Дизлайк", callback_data=f"rt:dislike:{series_id}"),
             ]
+        ]
+    )
+
+
+def swipe_keyboard(series_id: int, queue_idx: int) -> InlineKeyboardMarkup:
+    """Кнопки для свайп-вечера: лайк / пропуск / стоп."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👎 Скип", callback_data=f"sw:no:{series_id}:{queue_idx}"),
+                InlineKeyboardButton(text="❤️ Хочу!", callback_data=f"sw:yes:{series_id}:{queue_idx}"),
+            ],
+            [InlineKeyboardButton(text="🛑 Хватит на сегодня", callback_data=f"sw:stop:0:{queue_idx}")],
         ]
     )
