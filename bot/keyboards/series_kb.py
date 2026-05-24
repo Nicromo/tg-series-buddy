@@ -48,12 +48,13 @@ def card_keyboard(
 
 
 def search_results_keyboard(hits: list[tuple[int, str]]) -> InlineKeyboardMarkup:
-    """Кнопки выбора варианта поиска: '1️⃣ Название (2020)'."""
+    """Кнопки выбора варианта поиска: '1️⃣ Название (2020)' + 'Ничего не подходит'."""
     digits = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
     rows = []
     for i, (kp_id, label) in enumerate(hits[:10]):
         prefix = digits[i] if i < len(digits) else f"{i+1}."
         rows.append([InlineKeyboardButton(text=f"{prefix} {label}", callback_data=f"pick:{kp_id}")])
+    rows.append([InlineKeyboardButton(text="❌ Ничего из этого", callback_data="pick:none")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

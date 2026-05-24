@@ -113,11 +113,7 @@ class KinopoiskClient:
         docs = resp.json().get("docs", [])
         hits: list[KPSearchHit] = []
         for d in docs:
-            # Берём только сериалы / мини-сериалы / анимэ-сериалы
-            t = (d.get("type") or "").lower()
-            is_series = d.get("isSeries") is True or "series" in t or t == "anime"
-            if not is_series:
-                continue
+            # Берём и фильмы, и сериалы (без фильтра по типу)
             poster = (d.get("poster") or {}).get("url") or (d.get("poster") or {}).get("previewUrl")
             rating_kp = (d.get("rating") or {}).get("kp")
             hits.append(

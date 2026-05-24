@@ -312,7 +312,19 @@ def make_router(
     @router.callback_query(F.data.startswith("pick:"))
     async def cb_pick(call: CallbackQuery, state: FSMContext) -> None:
         await state.clear()
-        kp_id = int(call.data.split(":")[1])
+        arg = call.data.split(":")[1]
+        if arg == "none":
+            await call.answer("Ок, поищем заново")
+            try:
+                await call.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await call.message.answer(
+                "🔎 Уточни запрос — напиши название иначе (можно с годом или на оригинальном языке).\n"
+                "Или пришли постер фото 📸"
+            )
+            return
+        kp_id = int(arg)
         await call.answer("Загружаю…")
         await _add_by_kp_id(call.bot, call.message.chat.id, call.from_user.id, kp_id, session_factory, kp)
         try:
