@@ -92,6 +92,7 @@ class KinopoiskClient:
             timeout=timeout,
             base_url=base_url,
             headers={"X-API-KEY": api_key, "Accept": "application/json"},
+            follow_redirects=True,
         )
 
     async def close(self) -> None:
