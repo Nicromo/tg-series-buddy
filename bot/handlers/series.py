@@ -236,13 +236,35 @@ def make_router(
             await bot.send_message(chat_id, f"😕 Не получилось найти: {e}")
             return
 
-        # Если поиск ничего не нашёл — пробуем нормализовать запрос через Groq
-        if not hits and groq is not None:
+        # Проверим релевантность: содержит ли хотя бы один результат запрос как substring
+        def _looks_relevant(hits_list, q: str) -> bool:
+            if not hits_list:
+                return False
+            q_low = q.lower().strip()
+            # Берём первые 3 слова запроса (если они длинные)
+            words = [w for w in q_low.split() if len(w) >= 3]
+            if not words:
+                # Запрос короткий — проверяем что title начинается похоже
+                for h in hits_list[:3]:
+                    if h.title_ru and h.title_ru.lower().startswith(q_low[:4]):
+                        return True
+                return False
+            # Хотя бы один hit должен содержать хоть одно слово запроса
+            for h in hits_list[:5]:
+                blob = (h.title_ru + " " + (h.title_en or "")).lower()
+                if any(w in blob for w in words):
+                    return True
+            return False
+
+        # Если поиск ничего не нашёл или нашёл мусор — пробуем нормализовать через Groq
+        if (not hits or not _looks_relevant(hits, query)) and groq is not None:
             fixed = await groq.fix_query(query)
             if fixed and fixed.lower() != query.lower():
                 await bot.send_message(chat_id, f"💡 Может, ты имел в виду <b>{fixed}</b>? Ищу…", parse_mode="HTML")
                 try:
-                    hits = await kp.search(fixed, limit=5)
+                    new_hits = await kp.search(fixed, limit=5)
+                    if new_hits:
+                        hits = new_hits
                 except Exception:
                     pass
 
