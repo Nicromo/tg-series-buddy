@@ -10,6 +10,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
+import httpx
 from aiohttp import web
 
 from .config import Settings
@@ -62,6 +63,19 @@ async def start_http_server(port: int) -> web.AppRunner:
     return runner
 
 
+async def self_pinger(url: str, interval_s: int = 600) -> None:
+    """Раз в interval_s пингует свой /health чтобы Render free не усыплял контейнер."""
+    await asyncio.sleep(60)  # стартовая задержка чтобы бот успел подняться
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        while True:
+            try:
+                r = await client.get(f"{url.rstrip('/')}/health")
+                logging.info("self-ping status=%s", r.status_code)
+            except Exception as e:
+                logging.warning("self-ping failed: %s", e)
+            await asyncio.sleep(interval_s)
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -90,12 +104,23 @@ async def main() -> None:
     http_runner = await start_http_server(port)
     scheduler = start_scheduler(bot, session_factory, kp=kp)
 
+    # Self-ping чтобы Render free не усыплял контейнер (раз в 10 мин)
+    external_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("EXTERNAL_URL")
+    ping_task = None
+    if external_url:
+        ping_task = asyncio.create_task(self_pinger(external_url))
+        logging.info("Self-pinger started for %s", external_url)
+    else:
+        logging.info("RENDER_EXTERNAL_URL not set — self-pinger disabled")
+
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.set_my_commands(BOT_COMMANDS)
         logging.info("Bot commands set: %d", len(BOT_COMMANDS))
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        if ping_task:
+            ping_task.cancel()
         scheduler.shutdown(wait=False)
         await http_runner.cleanup()
         if groq:
