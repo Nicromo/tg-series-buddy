@@ -1,0 +1,186 @@
+"""Клиент kinopoisk.dev API.
+
+Документация: https://kinopoisk.dev/documentation
+Авторизация: header X-API-KEY.
+Базовый URL: https://api.kinopoisk.dev/v1.4
+
+Возвращает данные о сериалах: название, постер, рейтинги (КП/IMDb),
+описание, жанры, сезоны, трейлеры (часто сразу русские).
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+import httpx
+
+DEFAULT_API_BASE = "https://api.kinopoisk.dev/v1.4"
+# Альтернатива: https://api.poiskkino.dev/v1.4 (если используется ПоискКино)
+
+
+@dataclass
+class KPSearchHit:
+    kp_id: int
+    title_ru: str
+    title_en: Optional[str]
+    year: Optional[int]
+    poster_url: Optional[str]
+    short_description: Optional[str]
+    rating_kp: Optional[float]
+
+
+@dataclass
+class KPDetails:
+    kp_id: int
+    title_ru: str
+    title_en: Optional[str]
+    year: Optional[int]
+    description_ru: Optional[str]
+    poster_url: Optional[str]
+    genres: list[str] = field(default_factory=list)
+    rating_kp: Optional[float] = None
+    rating_imdb: Optional[float] = None
+    seasons: Optional[int] = None
+    status_kp: Optional[str] = None
+    is_series: bool = True
+
+    # Трейлеры: список URL (часто YouTube), русские в приоритете
+    trailers: list[str] = field(default_factory=list)
+
+    @property
+    def best_trailer_youtube_id(self) -> Optional[str]:
+        """Извлекаем YouTube-id из первой подходящей ссылки."""
+        for url in self.trailers:
+            if not url:
+                continue
+            yt_id = _extract_youtube_id(url)
+            if yt_id:
+                return yt_id
+        return None
+
+
+def _extract_youtube_id(url: str) -> Optional[str]:
+    """Из любой ссылки YouTube вытаскиваем 11-символьный id."""
+    if not url:
+        return None
+    # https://www.youtube.com/watch?v=XXXX
+    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    # https://youtu.be/XXXX
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    # https://www.youtube.com/embed/XXXX
+    m = re.search(r"youtube\.com/embed/([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+class KinopoiskClient:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        base_url: str = DEFAULT_API_BASE,
+        timeout: float = 15.0,
+    ) -> None:
+        self._client = httpx.AsyncClient(
+            timeout=timeout,
+            base_url=base_url,
+            headers={"X-API-KEY": api_key, "Accept": "application/json"},
+        )
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    # ---------- Поиск ----------
+
+    async def search(self, query: str, *, limit: int = 5) -> list[KPSearchHit]:
+        """Поиск по названию, отдаёт первые `limit` результатов.
+
+        Сериалы и фильмы вперемешку — фильтруем сериалы на стороне клиента.
+        """
+        resp = await self._client.get(
+            "/movie/search",
+            params={"query": query, "limit": limit * 3, "page": 1},
+        )
+        resp.raise_for_status()
+        docs = resp.json().get("docs", [])
+        hits: list[KPSearchHit] = []
+        for d in docs:
+            # Берём только сериалы / мини-сериалы / анимэ-сериалы
+            t = (d.get("type") or "").lower()
+            is_series = d.get("isSeries") is True or "series" in t or t == "anime"
+            if not is_series:
+                continue
+            poster = (d.get("poster") or {}).get("url") or (d.get("poster") or {}).get("previewUrl")
+            rating_kp = (d.get("rating") or {}).get("kp")
+            hits.append(
+                KPSearchHit(
+                    kp_id=int(d["id"]),
+                    title_ru=d.get("name") or d.get("alternativeName") or "?",
+                    title_en=d.get("alternativeName"),
+                    year=d.get("year"),
+                    poster_url=poster,
+                    short_description=d.get("shortDescription") or d.get("description"),
+                    rating_kp=float(rating_kp) if rating_kp else None,
+                )
+            )
+            if len(hits) >= limit:
+                break
+        return hits
+
+    # ---------- Детали ----------
+
+    async def get_details(self, kp_id: int) -> KPDetails:
+        resp = await self._client.get(f"/movie/{kp_id}")
+        resp.raise_for_status()
+        d = resp.json()
+
+        poster = (d.get("poster") or {}).get("url") or (d.get("poster") or {}).get("previewUrl")
+        rating = d.get("rating") or {}
+        genres = [g["name"] for g in (d.get("genres") or []) if g.get("name")]
+
+        # Сезоны: kinopoisk.dev возвращает seasonsInfo или totalSeasons
+        seasons = None
+        if d.get("seasonsInfo"):
+            seasons = len(d["seasonsInfo"])
+        elif d.get("totalSeasons"):
+            seasons = int(d["totalSeasons"])
+
+        # Трейлеры
+        trailers_raw = ((d.get("videos") or {}).get("trailers") or [])
+        # Сортируем: предпочитаем те, в названии которых есть "рус", "ru", "трейлер"
+        def _trailer_score(t: dict) -> int:
+            name = (t.get("name") or "").lower()
+            score = 0
+            if "рус" in name or " ru " in f" {name} " or name.startswith("ru "):
+                score += 10
+            if "трейлер" in name or "trailer" in name:
+                score += 5
+            if "тизер" in name or "teaser" in name:
+                score += 2
+            return -score  # сортируем по убыванию — лучшие первыми
+
+        trailers_sorted = sorted(trailers_raw, key=_trailer_score)
+        trailers = [t["url"] for t in trailers_sorted if t.get("url")]
+
+        return KPDetails(
+            kp_id=int(d["id"]),
+            title_ru=d.get("name") or d.get("alternativeName") or "?",
+            title_en=d.get("alternativeName"),
+            year=d.get("year"),
+            description_ru=d.get("description") or d.get("shortDescription"),
+            poster_url=poster,
+            genres=genres,
+            rating_kp=float(rating.get("kp")) if rating.get("kp") else None,
+            rating_imdb=float(rating.get("imdb")) if rating.get("imdb") else None,
+            seasons=seasons,
+            status_kp=d.get("status"),
+            is_series=bool(d.get("isSeries") or ((d.get("type") or "").lower().endswith("series"))),
+            trailers=trailers,
+        )
