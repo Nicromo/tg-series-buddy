@@ -873,19 +873,45 @@ async def _add_by_kp_id(
         logger.exception("KP details failed")
         await bot.send_message(chat_id, f"😕 Не получилось загрузить детали: {e}")
         return
+    mirrored_to_partner = False
     async with session_factory() as session:
-        await repo.get_or_create_user(session, tg_id=tg_user_id, username=None, full_name=None)
+        user = await repo.get_or_create_user(session, tg_id=tg_user_id, username=None, full_name=None)
         await repo.upsert_series_from_dict(session, _details_to_series_dict(details))
         await session.commit()
         series = await repo.get_series_by_kp_id(session, details.kp_id)
         us = await repo.get_user_series(session, tg_user_id, series.id)
+        was_existing = us is not None
+        # Auto-add to "want" если впервые
+        if us is None:
+            us = await repo.set_user_series_status(session, tg_user_id, series.id, "want")
+            await session.commit()
+        # В паре — зеркалим у партнёра (если у него ещё нет этого сериала)
+        if user.pair_id:
+            members = await repo.get_pair_members(session, user.pair_id)
+            for member in members:
+                if member.id == tg_user_id:
+                    continue
+                partner_us = await repo.get_user_series(session, member.id, series.id)
+                if partner_us is None:
+                    await repo.set_user_series_status(session, member.id, series.id, "want")
+                    mirrored_to_partner = True
+            await session.commit()
         status = us.status if us else None
         rating = us.rating if us else None
         note = us.notes if us else None
-    if status:
+
+    if was_existing:
         await bot.send_message(
             chat_id,
-            f"💡 <b>{series.title_ru}</b> уже у тебя — статус: {STATUS_LABELS.get(status, status)}.\nМожешь поменять кнопками ниже 👇",
+            f"💡 <b>{series.title_ru}</b> уже у тебя — статус: {STATUS_LABELS.get(status, status)}.\n"
+            f"Можешь поменять кнопками ниже 👇",
+            parse_mode="HTML",
+        )
+    else:
+        suffix = " 👫 (общий список с партнёром)" if mirrored_to_partner else ""
+        await bot.send_message(
+            chat_id,
+            f"✅ <b>{series.title_ru}</b> добавлен в «👀 Хочу посмотреть»{suffix}",
             parse_mode="HTML",
         )
     await _send_card(bot, chat_id, series, user_status=status, user_rating=rating, note=note)
