@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import secrets
 from typing import Optional, Sequence
 
@@ -12,17 +13,23 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from .models import Base, Pair, Series, User, UserSeries
+from .models import Base, Pair, Series, User, UserSeries, utcnow
 
 
 def make_engine(db_path: str):
-    """Create async engine for SQLite at the given path."""
     return create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False, future=True)
 
 
 async def init_db(engine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Lightweight migration: add last_checkin_at if missing (SQLite only)
+        try:
+            await conn.exec_driver_sql(
+                "ALTER TABLE user_series ADD COLUMN last_checkin_at DATETIME"
+            )
+        except Exception:
+            pass  # column already exists
 
 
 def make_session_factory(engine) -> async_sessionmaker[AsyncSession]:
@@ -49,7 +56,6 @@ async def get_or_create_user(
 
 
 async def create_pair_for_user(session: AsyncSession, user: User) -> Pair:
-    """Create a new pair with an invite code and attach the user to it."""
     invite = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")[:10]
     pair = Pair(invite_code=invite)
     session.add(pair)
@@ -76,6 +82,11 @@ async def get_pair_members(session: AsyncSession, pair_id: int) -> Sequence[User
     return result.scalars().all()
 
 
+async def list_all_users(session: AsyncSession) -> Sequence[User]:
+    result = await session.execute(select(User))
+    return result.scalars().all()
+
+
 # ---------- Series ----------
 
 async def get_series_by_kp_id(session: AsyncSession, kp_id: int) -> Optional[Series]:
@@ -84,7 +95,6 @@ async def get_series_by_kp_id(session: AsyncSession, kp_id: int) -> Optional[Ser
 
 
 async def upsert_series_from_dict(session: AsyncSession, data: dict) -> Series:
-    """Create or update a series by kp_id."""
     existing = await get_series_by_kp_id(session, data["kp_id"])
     if existing:
         for k, v in data.items():
@@ -96,12 +106,6 @@ async def upsert_series_from_dict(session: AsyncSession, data: dict) -> Series:
     session.add(series)
     await session.flush()
     return series
-
-
-async def update_series(session: AsyncSession, series: Series, **fields) -> None:
-    for k, v in fields.items():
-        setattr(series, k, v)
-    await session.flush()
 
 
 # ---------- UserSeries ----------
@@ -142,6 +146,26 @@ async def set_user_series_rating(
     return us
 
 
+async def get_user_series(
+    session: AsyncSession, user_id: int, series_id: int
+) -> Optional[UserSeries]:
+    result = await session.execute(
+        select(UserSeries).where(
+            UserSeries.user_id == user_id, UserSeries.series_id == series_id
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def mark_checkin_sent(
+    session: AsyncSession, user_id: int, series_id: int
+) -> None:
+    us = await get_user_series(session, user_id, series_id)
+    if us:
+        us.last_checkin_at = utcnow()
+        await session.flush()
+
+
 async def list_user_series(
     session: AsyncSession, user_id: int, status: Optional[str] = None
 ) -> Sequence[tuple[UserSeries, Series]]:
@@ -157,10 +181,29 @@ async def list_user_series(
     return result.all()
 
 
+async def list_checkin_candidates(
+    session: AsyncSession, *, older_than_days: int = 6
+) -> Sequence[tuple[int, int, str]]:
+    """Return (user_id, series_id, series_title) for everyone whose 'watching' series
+    were last asked about >= older_than_days ago (or never)."""
+    threshold = utcnow() - dt.timedelta(days=older_than_days)
+    stmt = (
+        select(UserSeries.user_id, Series.id, Series.title_ru)
+        .join(Series, UserSeries.series_id == Series.id)
+        .where(UserSeries.status == "watching")
+        .where(
+            (UserSeries.last_checkin_at.is_(None))
+            | (UserSeries.last_checkin_at < threshold)
+        )
+    )
+    result = await session.execute(stmt)
+    return result.all()
+
+
 async def list_pair_matches(
     session: AsyncSession, pair_id: int
 ) -> Sequence[Series]:
-    """Series both pair members liked."""
+    """Series both pair members liked (only watched/want_rewatch)."""
     members = await get_pair_members(session, pair_id)
     if len(members) < 2:
         return []

@@ -73,7 +73,15 @@ class Series(Base):
 
 
 class UserSeries(Base):
-    """user <-> series association with status and rating."""
+    """user <-> series association with status and rating.
+
+    Statuses:
+      want         - want to watch
+      watching     - currently watching
+      watched      - finished watching (must have rating)
+      want_rewatch - want to rewatch
+      dropped      - dropped
+    """
 
     __tablename__ = "user_series"
     __table_args__ = (UniqueConstraint("user_id", "series_id", name="uq_user_series"),)
@@ -82,10 +90,11 @@ class UserSeries(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     series_id: Mapped[int] = mapped_column(ForeignKey("series.id"), index=True)
 
-    # want / watching / watched / dropped
     status: Mapped[str] = mapped_column(String(16), default="want")
-    # like / dislike / null
-    rating: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    rating: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # like / dislike
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # When we last sent the weekly check-in for this series (to avoid spam).
+    last_checkin_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
 
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)

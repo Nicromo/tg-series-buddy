@@ -1,4 +1,4 @@
-"""Регистрация, /start, /help, /pair."""
+"""Registration, /start, /help, /pair."""
 
 from __future__ import annotations
 
@@ -11,17 +11,20 @@ from ..db import repository as repo
 from ..db.models import Pair
 
 HELP_TEXT = (
-    "🎬 <b>Семейный учёт сериалов</b>\n\n"
-    "<b>Базовые команды:</b>\n"
+    "🛋️ <b>Диванные критики</b> — семейный учёт сериалов\n\n"
+    "<b>Команды:</b>\n"
     "/add &lt;название&gt; — найти и добавить сериал\n"
     "/list — что хотим посмотреть\n"
     "/watching — что смотрим сейчас\n"
     "/watched — что досмотрели\n"
+    "/rewatch — что хотим пересмотреть\n"
     "/random — случайный из очереди\n"
-    "/match — что лайкнули вы оба\n\n"
+    "/match — что лайкнули вы оба\n"
+    "/checkin — спросить про активные сериалы прямо сейчас\n\n"
     "<b>Пара:</b>\n"
-    "/pair — получить инвайт-код (для жены)\n"
-    "/pair &lt;код&gt; — присоединиться к чужой паре"
+    "/pair — получить инвайт-код для партнёра\n"
+    "/pair &lt;код&gt; — присоединиться к паре\n\n"
+    "Каждое воскресенье в 22:00 спрошу как у тебя дела с тем, что смотришь 📺"
 )
 
 
@@ -46,8 +49,6 @@ def make_router(session_factory: async_sessionmaker) -> Router:
 
     @router.message(Command("pair"))
     async def cmd_pair(message: Message) -> None:
-        # /pair          → создать/показать инвайт-код
-        # /pair <code>   → присоединиться к паре
         parts = (message.text or "").split(maxsplit=1)
         async with session_factory() as session:
             user = await repo.get_or_create_user(
@@ -79,8 +80,6 @@ def make_router(session_factory: async_sessionmaker) -> Router:
                 await message.answer("❌ Код не найден. Проверь правильность.")
                 return
             await session.commit()
-            await message.answer(
-                "✅ Вы в одной паре. Теперь /match покажет ваши общие лайки."
-            )
+            await message.answer("✅ Вы в одной паре. Теперь /match покажет ваши общие лайки.")
 
     return router

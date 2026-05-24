@@ -1,5 +1,5 @@
-"""Хендлеры: /add, /list, /watching, /watched, /random, /match
-и все callback-кнопки. Источник данных: kinopoisk.dev (или совместимый poiskkino.dev).
+"""Handlers: /add, /list, /watching, /watched, /rewatch, /random, /match, /checkin
+and all callback buttons. Data source: kinopoisk.dev.
 """
 
 from __future__ import annotations
@@ -20,8 +20,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from ..config import Settings
 from ..db import repository as repo
 from ..db.models import Series
-from ..keyboards.series_kb import card_keyboard, search_results_keyboard
+from ..keyboards.series_kb import (
+    card_keyboard,
+    checkin_keyboard,
+    rating_only_keyboard,
+    search_results_keyboard,
+)
 from ..services.kinopoisk import KinopoiskClient, KPDetails
+from ..services.scheduler import run_weekly_checkin
 from ..services.trailer import fetch_best_trailer
 
 logger = logging.getLogger(__name__)
@@ -30,6 +36,7 @@ STATUS_LABELS = {
     "want": "👀 Хочу посмотреть",
     "watching": "▶️ Смотрю",
     "watched": "✅ Посмотрел",
+    "want_rewatch": "🔁 Хочу пересмотреть",
     "dropped": "❌ Дропнул",
 }
 
@@ -92,7 +99,12 @@ async def _send_card(
     user_rating: Optional[str] = None,
 ) -> None:
     caption = _format_caption(series, status=user_status, rating=user_rating)
-    kb = card_keyboard(series.id, has_trailer=bool(series.trailer_youtube_id or series.trailer_file_id))
+    is_watched = user_status == "watched"
+    kb = card_keyboard(
+        series.id,
+        has_trailer=bool(series.trailer_youtube_id or series.trailer_file_id),
+        is_watched=is_watched,
+    )
 
     if series.poster_url:
         try:
@@ -217,6 +229,51 @@ def make_router(
             await session.commit()
         await call.answer(f"Ок: {RATING_LABELS.get(rating, rating)}")
 
+    @router.callback_query(F.data.startswith("ck:"))
+    async def cb_checkin(call: CallbackQuery) -> None:
+        """Weekly check-in: 'finished / still watching / dropped'."""
+        _, action, series_id_s = call.data.split(":")
+        series_id = int(series_id_s)
+
+        if action == "fin":
+            # Mark as watched
+            async with session_factory() as session:
+                await repo.get_or_create_user(
+                    session,
+                    tg_id=call.from_user.id,
+                    username=call.from_user.username,
+                    full_name=call.from_user.full_name,
+                )
+                us = await repo.set_user_series_status(session, call.from_user.id, series_id, "watched")
+                await session.commit()
+                # If no rating yet -- ask for it
+                if not us.rating:
+                    series = await session.get(Series, series_id)
+                    title = series.title_ru if series else "сериал"
+                    await call.message.answer(
+                        f"Поставь оценку <b>{title}</b>:",
+                        parse_mode="HTML",
+                        reply_markup=rating_only_keyboard(series_id),
+                    )
+            await call.answer("Ок: ✅ Досмотрел")
+        elif action == "cont":
+            # Still watching -- just record the check-in
+            async with session_factory() as session:
+                await repo.mark_checkin_sent(session, call.from_user.id, series_id)
+                await session.commit()
+            await call.answer("Ок: ▶️ Спрошу через неделю")
+        elif action == "drop":
+            async with session_factory() as session:
+                await repo.get_or_create_user(
+                    session,
+                    tg_id=call.from_user.id,
+                    username=call.from_user.username,
+                    full_name=call.from_user.full_name,
+                )
+                await repo.set_user_series_status(session, call.from_user.id, series_id, "dropped")
+                await session.commit()
+            await call.answer("Ок: ❌ Дропнул")
+
     @router.callback_query(F.data.startswith("tr:"))
     async def cb_trailer(call: CallbackQuery) -> None:
         series_id = int(call.data.split(":")[1])
@@ -309,6 +366,10 @@ def make_router(
     async def cmd_watched(message: Message) -> None:
         await _send_list(message, "watched", "Ещё ничего не досмотрел до конца.")
 
+    @router.message(Command("rewatch"))
+    async def cmd_rewatch(message: Message) -> None:
+        await _send_list(message, "want_rewatch", "Список пересмотра пустой. Жми 🔁 в карточке досмотренного сериала.")
+
     @router.message(Command("random"))
     async def cmd_random(message: Message) -> None:
         async with session_factory() as session:
@@ -338,6 +399,12 @@ def make_router(
         await message.answer(f"💛 Лайкнули оба ({len(matches)}):")
         for series in matches[:20]:
             await _send_card(message.bot, message.chat.id, series)
+
+    @router.message(Command("checkin"))
+    async def cmd_checkin_manual(message: Message) -> None:
+        """Manually trigger the weekly check-in (for testing / on-demand)."""
+        sent = await run_weekly_checkin(message.bot, session_factory)
+        await message.answer(f"🔔 Опрос отправлен: {sent} сериал(ов).")
 
     return router
 

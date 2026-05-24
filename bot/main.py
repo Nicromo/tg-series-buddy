@@ -1,8 +1,4 @@
-"""Entry point: starts aiogram bot polling + tiny aiohttp /health server in parallel.
-
-The HTTP server is required for free hosting (Render Web Service expects a port).
-Bot work happens via Telegram polling; HTTP is only for health checks / wake-ups.
-"""
+"""Entry point: aiogram bot polling + aiohttp /health + weekly check-in scheduler."""
 
 from __future__ import annotations
 
@@ -19,6 +15,7 @@ from .db.repository import init_db, make_engine, make_session_factory
 from .handlers import series as series_handlers
 from .handlers import start as start_handlers
 from .services.kinopoisk import KinopoiskClient
+from .services.scheduler import start_scheduler
 
 
 async def _health(_: web.Request) -> web.Response:
@@ -64,14 +61,16 @@ async def main() -> None:
     dp.include_router(start_handlers.make_router(session_factory))
     dp.include_router(series_handlers.make_router(session_factory, kp, settings))
 
-    # HTTP server for Render free Web Service (must bind to PORT)
     port = int(os.getenv("PORT", "8080"))
     http_runner = await start_http_server(port)
+
+    scheduler = start_scheduler(bot, session_factory)
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        scheduler.shutdown(wait=False)
         await http_runner.cleanup()
         await kp.close()
         await bot.session.close()

@@ -5,3 +5,4 @@ httpx==0.27.2
 python-dotenv==1.0.1
 yt-dlp==2024.11.18
 aiohttp==3.10.10
+apscheduler==3.10.4
