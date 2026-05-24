@@ -99,6 +99,11 @@ def make_router(session_factory: async_sessionmaker) -> Router:
                     await message.answer(cap, parse_mode="HTML")
                     return
 
+        # Маленький "хлоп" перед приветствием — Telegram анимирует одиночный эмоджи
+        try:
+            await message.answer("🍿🎬")
+        except Exception:
+            pass
         await message.answer(WELCOME, parse_mode="HTML", reply_markup=main_menu())
         await message.answer(HELP_TEXT, parse_mode="HTML")
 

@@ -15,7 +15,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
+    InlineQuery,
+    InlineQueryResultArticle,
     InputMediaPhoto,
+    InputTextMessageContent,
     Message,
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -34,7 +37,7 @@ from ..keyboards.series_kb import (
 from ..services.groq_ai import GroqClient
 from ..services.kinopoisk import KinopoiskClient, KPDetails
 from ..services.scheduler import run_weekly_checkin
-from ..services.trailer import fetch_best_trailer
+from ..services.trailer import fetch_best_trailer, find_trailer_tg_link
 
 logger = logging.getLogger(__name__)
 
@@ -455,7 +458,15 @@ def make_router(
             max_mb=settings.max_trailer_mb,
         )
         if path is None:
-            await call.message.answer("😕 Не получилось скачать трейлер.")
+            # Fallback: ищем ссылку на пост в TG-канале — Telegram сам отрисует превью с видео
+            tg_link = await find_trailer_tg_link(title, year)
+            if tg_link:
+                await call.message.answer(
+                    f"🎥 Нашёл трейлер в TG-канале: {tg_link}",
+                    disable_web_page_preview=False,
+                )
+            else:
+                await call.message.answer("😕 Не получилось найти трейлер.")
             return
         try:
             msg = await call.bot.send_video(
@@ -853,6 +864,49 @@ def make_router(
         if len(text) < 2:
             return
         await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, text, state=state)
+
+
+    # ============== Inline-режим: @bot Severance в любом чате ==============
+    @router.inline_query()
+    async def inline_search(query: InlineQuery) -> None:
+        q = (query.query or "").strip()
+        if len(q) < 2:
+            await query.answer([], cache_time=10, is_personal=True)
+            return
+        try:
+            hits = await kp.search(q, limit=10)
+        except Exception as e:
+            logger.warning("inline KP search failed: %s", e)
+            await query.answer([], cache_time=5, is_personal=True)
+            return
+        bot_user = await query.bot.me()
+        results = []
+        for h in hits[:10]:
+            title = h.title_ru + (f" ({h.year})" if h.year else "")
+            rating = f" ⭐ КП {h.rating_kp:.1f}" if h.rating_kp else ""
+            short = (h.short_description or "")[:120]
+            text = f"🎬 <b>{h.title_ru}</b>"
+            if h.year:
+                text += f" ({h.year})"
+            if h.rating_kp:
+                text += f"\n⭐ КП {h.rating_kp:.1f}"
+            if h.short_description:
+                text += "\n\n" + (h.short_description[:300])
+            text += f"\n\n👉 <a href=\"https://t.me/{bot_user.username}?start=show_{h.kp_id}\">Открыть в боте «Диванные критики»</a>"
+            results.append(
+                InlineQueryResultArticle(
+                    id=str(h.kp_id),
+                    title=title + rating,
+                    description=short,
+                    thumbnail_url=h.poster_url or None,
+                    input_message_content=InputTextMessageContent(
+                        message_text=text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=False,
+                    ),
+                )
+            )
+        await query.answer(results, cache_time=60, is_personal=True)
 
     return router
 

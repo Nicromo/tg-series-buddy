@@ -134,3 +134,19 @@ async def fetch_best_trailer(
             return path, f"TMDB ({tmdb_language or 'en'})"
 
     return None, "не найден"
+
+
+async def find_trailer_tg_link(title_ru: str, year=None) -> "Optional[str]":
+    """Ищет ссылку на пост с трейлером в публичных TG-каналах (t.me/s/...).
+
+    Возвращает URL вида https://t.me/<channel>/<post_id> — Telegram сам отрисует превью с видео.
+    """
+    try:
+        from .tg_channel_parser import search_trailer_in_channels
+        q = title_ru if not year else f"{title_ru} {year}"
+        links = await search_trailer_in_channels(q, limit=1)
+        if links:
+            return links[0]
+    except Exception as e:
+        logger.warning("TG trailer search failed: %s", e)
+    return None
