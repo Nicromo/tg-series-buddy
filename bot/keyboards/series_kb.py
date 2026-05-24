@@ -40,10 +40,10 @@ def card_keyboard(
         ]
     )
 
-    if has_trailer:
-        rows.append(
-            [InlineKeyboardButton(text="🎥 Показать трейлер", callback_data=f"tr:{series_id}")]
-        )
+    # Кнопка трейлера ВСЕГДА -- yt-dlp найдёт через YouTube-поиск, даже если в KP нет ссылки
+    rows.append(
+        [InlineKeyboardButton(text="🎥 Показать трейлер", callback_data=f"tr:{series_id}")]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

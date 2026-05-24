@@ -72,6 +72,9 @@ def _format_caption(s: Series, *, status: Optional[str] = None, rating: Optional
     if s.year:
         title += f" ({s.year})"
     lines.append(title)
+    # Ссылка на Кинопоиск
+    if s.kp_id:
+        lines.append(f'<a href="https://www.kinopoisk.ru/film/{s.kp_id}/">🔗 Открыть на Кинопоиске</a>')
 
     rating_bits = []
     if s.rating_kp:
@@ -587,79 +590,29 @@ def make_router(
         if not rows:
             await message.answer(empty_msg)
             return
-
-        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
-        digits = ["1\u20e3", "2\u20e3", "3\u20e3", "4\u20e3", "5\u20e3", "6\u20e3", "7\u20e3", "8\u20e3", "9\u20e3", "\U0001f51f"]
-        page = rows[:10]
-
-        # Текстовый список с эмоджи
-        lines = []
         if header:
-            lines.append(header)
-            lines.append("")
-        for i, (us, series) in enumerate(page):
-            prefix = digits[i] if i < len(digits) else f"{i+1}."
-            line = f"{prefix} <b>{series.title_ru}</b>"
-            if series.year:
-                line += f" ({series.year})"
-            extras = []
-            if series.rating_kp:
-                extras.append(f"\u2b50 {series.rating_kp:.1f}")
-            if series.seasons:
-                extras.append(f"\U0001f4fa {series.seasons} \u0441\u0435\u0437.")
-            if us.rating == "like":
-                extras.append("\U0001f44d")
-            elif us.rating == "dislike":
-                extras.append("\U0001f44e")
-            if extras:
-                line += "   <i>" + " \u00b7 ".join(extras) + "</i>"
-            lines.append(line)
-        caption = "\n".join(lines)
+            await message.answer(f"{header}  ·  {len(rows)} шт.", parse_mode="HTML")
 
-        # media_group из постеров (caption на первом)
-        media: list[InputMediaPhoto] = []
-        for i, (us, series) in enumerate(page):
-            if not series.poster_url:
-                continue
-            cap = caption if not media else None
-            try:
-                media.append(InputMediaPhoto(media=series.poster_url, caption=cap, parse_mode="HTML" if cap else None))
-            except Exception:
-                pass
-        if len(media) >= 2:
-            try:
-                await message.bot.send_media_group(message.chat.id, media=media[:10])
-            except Exception as e:
-                logger.warning("send_media_group failed: %s", e)
-                await message.answer(caption, parse_mode="HTML")
-        else:
-            await message.answer(caption, parse_mode="HTML")
+        # Отправляем полноценные карточки с постером и кнопками
+        for us, series in rows[:10]:
+            await _send_card(
+                message.bot, message.chat.id, series,
+                user_status=us.status, user_rating=us.rating, note=us.notes,
+            )
 
-        # Кнопки: открыть карточку по номеру (по 5 в ряд)
-        open_buttons: list[list[IKB]] = []
-        row: list[IKB] = []
-        for i, (us, series) in enumerate(page):
-            label = digits[i] if i < len(digits) else f"{i+1}"
-            row.append(IKB(text=label, callback_data=f"open:{series.id}"))
-            if len(row) == 5:
-                open_buttons.append(row)
-                row = []
-        if row:
-            open_buttons.append(row)
-
-        # Доп. кнопки в зависимости от списка
-        action_row: list[IKB] = []
+        # Дополнительные кнопки внизу — bulk + random
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        action_row = []
         if status == "want":
-            action_row.append(IKB(text="\U0001f3b2 \u0421\u043b\u0443\u0447\u0430\u0439\u043d\u044b\u0439", callback_data="open_random:want"))
-            action_row.append(IKB(text="\u25b6\ufe0f \u0412\u0441\u0435 \u0432 \u0441\u043c\u043e\u0442\u0440\u044e", callback_data="bulk:want:watching"))
-        elif status == "watching":
-            action_row.append(IKB(text="\u2705 \u0412\u0441\u0435 \u0434\u043e\u0441\u043c\u043e\u0442\u0440\u0435\u043b", callback_data="bulk:watching:watched"))
+            action_row.append(IKB(text="🎲 Случайный", callback_data="open_random:want"))
+            if len(rows) >= 2:
+                action_row.append(IKB(text=f"▶️ Все в смотрю ({len(rows)})", callback_data="bulk:want:watching"))
+        elif status == "watching" and len(rows) >= 2:
+            action_row.append(IKB(text=f"✅ Все досмотрел ({len(rows)})", callback_data="bulk:watching:watched"))
         if action_row:
-            open_buttons.append(action_row)
-
-        if open_buttons:
-            footer = f"\U0001f447 \u0422\u044b\u043a\u043d\u0438 \u043d\u043e\u043c\u0435\u0440 \u0447\u0442\u043e\u0431\u044b \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0440\u0442\u043e\u0447\u043a\u0443 ({len(page)} \u0438\u0437 {len(rows)}):"
-            await message.answer(footer, reply_markup=IKM(inline_keyboard=open_buttons))
+            await message.answer("⬇️ Что дальше:", reply_markup=IKM(inline_keyboard=[action_row]))
+        if len(rows) > 10:
+            await message.answer(f"… показал первые 10 из {len(rows)}. Используй /find для поиска по списку.")
 
     @router.message(Command("list"))
     async def cmd_list(message: Message) -> None:
