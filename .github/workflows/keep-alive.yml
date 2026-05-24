@@ -1,0 +1,19 @@
+name: keep-alive
+
+on:
+  schedule:
+    # Каждые 10 минут (Render free service спит через 15 мин)
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render health endpoint
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 https://tg-series-buddy.onrender.com/health)
+          echo "HTTP status: $STATUS"
+          if [ "$STATUS" -ne 200 ]; then
+            echo "Unexpected status, but service may have just been woken up. Will retry next run."
+          fi
