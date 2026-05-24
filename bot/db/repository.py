@@ -20,8 +20,12 @@ def make_engine(db_url: str):
     """Create async engine. Accepts either sqlite+aiosqlite:/// or postgresql+asyncpg://"""
     kwargs = {"echo": False, "future": True}
     if db_url.startswith("postgresql"):
-        # Neon/Supabase free tier requires SSL; asyncpg handles it via ssl=True
-        kwargs["connect_args"] = {"ssl": True}
+        # Neon/Supabase: SSL + disable asyncpg prepared statement cache (PgBouncer compat)
+        kwargs["connect_args"] = {
+            "ssl": True,
+            "statement_cache_size": 0,
+            "prepared_statement_cache_size": 0,
+        }
         kwargs["pool_pre_ping"] = True
     return create_async_engine(db_url, **kwargs)
 
