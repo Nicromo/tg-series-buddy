@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ..db import repository as repo
 from ..keyboards.series_kb import checkin_keyboard
+from .kinopoisk import KinopoiskClient
+from .season_watcher import check_new_seasons
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +56,7 @@ async def run_weekly_checkin(bot: Bot, session_factory: async_sessionmaker) -> i
     return sent
 
 
-def start_scheduler(bot: Bot, session_factory: async_sessionmaker) -> AsyncIOScheduler:
+def start_scheduler(bot: Bot, session_factory: async_sessionmaker, kp: KinopoiskClient | None = None) -> AsyncIOScheduler:
     """Start APScheduler with the weekly check-in job. Returns the scheduler."""
     scheduler = AsyncIOScheduler(timezone="UTC")
     # Sun 19:00 UTC = Sun 22:00 Moscow
@@ -65,6 +67,15 @@ def start_scheduler(bot: Bot, session_factory: async_sessionmaker) -> AsyncIOSch
         id="weekly_checkin",
         replace_existing=True,
     )
+    if kp is not None:
+        # Каждый понедельник 09:00 UTC — проверка новых сезонов
+        scheduler.add_job(
+            check_new_seasons,
+            trigger=CronTrigger(day_of_week="mon", hour=9, minute=0),
+            args=[bot, session_factory, kp],
+            id="season_watcher",
+            replace_existing=True,
+        )
     scheduler.start()
-    logger.info("Scheduler started: weekly_checkin at Sun 19:00 UTC")
+    logger.info("Scheduler started: weekly_checkin Sun 19:00 UTC + season_watcher Mon 09:00 UTC")
     return scheduler

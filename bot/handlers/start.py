@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from aiogram import F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ..db import repository as repo
-from ..db.models import Pair
+from ..db.models import Pair, Series
 from ..keyboards.main_menu import main_menu
 
 WELCOME = (
@@ -55,7 +55,7 @@ def make_router(session_factory: async_sessionmaker) -> Router:
     router = Router(name="start")
 
     @router.message(CommandStart())
-    async def cmd_start(message: Message) -> None:
+    async def cmd_start(message: Message, command: CommandObject = None) -> None:
         async with session_factory() as session:
             await repo.get_or_create_user(
                 session,
@@ -64,6 +64,41 @@ def make_router(session_factory: async_sessionmaker) -> Router:
                 full_name=message.from_user.full_name,
             )
             await session.commit()
+
+            # Deep link: /start show_<series_id> — открыть карточку конкретного сериала
+            arg = (command.args or "").strip() if command else ""
+            if arg.startswith("show_"):
+                try:
+                    series_id = int(arg[len("show_"):])
+                    series = await session.get(Series, series_id)
+                except Exception:
+                    series = None
+                if series:
+                    await message.answer(
+                        f"\U0001f3ac \u041a\u0430\u0440\u0442\u043e\u0447\u043a\u0430 \u043e\u0442 \u043f\u0430\u0440\u0442\u043d\u0451\u0440\u0430:",
+                        reply_markup=main_menu(),
+                    )
+                    # Render card directly here (without /add flow). Simple: just message with poster.
+                    caption_lines = [f"\U0001f3ac <b>{series.title_ru}</b>"]
+                    if series.year:
+                        caption_lines[0] += f" ({series.year})"
+                    if series.rating_kp:
+                        caption_lines.append(f"\u2b50 \u041a\u041f {series.rating_kp:.1f}")
+                    if series.description_ru:
+                        d = series.description_ru[:400]
+                        caption_lines.append("")
+                        caption_lines.append(d + ("\u2026" if len(series.description_ru) > 400 else ""))
+                    cap = "\n".join(caption_lines)
+                    cap += f"\n\n\U0001f4ac \u0427\u0442\u043e\u0431\u044b \u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u0441\u0435\u0431\u0435 \u2014 \u043d\u0430\u043f\u0438\u0448\u0438: <code>/add {series.title_ru}</code>"
+                    if series.poster_url:
+                        try:
+                            await message.bot.send_photo(message.chat.id, photo=series.poster_url, caption=cap, parse_mode="HTML")
+                            return
+                        except Exception:
+                            pass
+                    await message.answer(cap, parse_mode="HTML")
+                    return
+
         await message.answer(WELCOME, parse_mode="HTML", reply_markup=main_menu())
         await message.answer(HELP_TEXT, parse_mode="HTML")
 

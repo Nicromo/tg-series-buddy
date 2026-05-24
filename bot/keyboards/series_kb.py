@@ -91,3 +91,14 @@ def swipe_keyboard(series_id: int, queue_idx: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🛑 Хватит на сегодня", callback_data=f"sw:stop:0:{queue_idx}")],
         ]
     )
+
+def bulk_move_keyboard(from_status: str, to_status: str, count: int) -> InlineKeyboardMarkup:
+    """Кнопка 'перевести все' под списком."""
+    labels = {
+        ("want", "watching"): f"▶️ Начать смотреть все ({count})",
+        ("watching", "watched"): f"✅ Отметить все досмотренными ({count})",
+    }
+    label = labels.get((from_status, to_status), f"Перевести все ({count})")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=label, callback_data=f"bulk:{from_status}:{to_status}")]]
+    )

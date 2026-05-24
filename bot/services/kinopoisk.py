@@ -135,6 +135,45 @@ class KinopoiskClient:
                 break
         return hits
 
+
+    async def get_upcoming_series(self, *, year: Optional[int] = None, genres: Optional[list[str]] = None, limit: int = 10) -> list[KPSearchHit]:
+        """Возвращает грядущие/недавние сериалы. Фильтр по году и жанрам."""
+        params = {
+            "limit": str(limit),
+            "page": "1",
+            "isSeries": "true",
+            "sortField": "year",
+            "sortType": "-1",
+        }
+        if year:
+            params["year"] = str(year)
+        if genres:
+            for g in genres[:3]:
+                params["genres.name"] = g  # multiple support via repeated key is API-specific
+        try:
+            resp = await self._client.get("/movie", params=params)
+            resp.raise_for_status()
+            docs = resp.json().get("docs", [])
+        except Exception as e:
+            return []
+        hits: list[KPSearchHit] = []
+        for d in docs:
+            t = (d.get("type") or "").lower()
+            if not (d.get("isSeries") is True or "series" in t or t == "anime"):
+                continue
+            poster = (d.get("poster") or {}).get("url") or (d.get("poster") or {}).get("previewUrl")
+            rating_kp = (d.get("rating") or {}).get("kp")
+            hits.append(KPSearchHit(
+                kp_id=int(d["id"]),
+                title_ru=d.get("name") or d.get("alternativeName") or "?",
+                title_en=d.get("alternativeName"),
+                year=d.get("year"),
+                poster_url=poster,
+                short_description=d.get("shortDescription") or d.get("description"),
+                rating_kp=float(rating_kp) if rating_kp else None,
+            ))
+        return hits
+
     # ---------- Детали ----------
 
     async def get_details(self, kp_id: int) -> KPDetails:

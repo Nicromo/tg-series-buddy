@@ -15,6 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
+    InputMediaPhoto,
     Message,
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -23,6 +24,7 @@ from ..config import Settings
 from ..db import repository as repo
 from ..db.models import Series, UserSeries
 from ..keyboards.series_kb import (
+    bulk_move_keyboard,
     card_keyboard,
     checkin_keyboard,
     rating_only_keyboard,
@@ -239,37 +241,64 @@ def make_router(
             await _add_by_kp_id(bot, chat_id, tg_user_id, hits[0].kp_id, session_factory, kp)
             return
 
-        # Показываем по одному варианту с постером + ссылкой на Кинопоиск
-        digits = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-        await bot.send_message(chat_id, f"🤔 <b>Вы имеете в виду:</b>", parse_mode="HTML")
-        for i, h in enumerate(hits[:10]):
-            prefix = digits[i] if i < len(digits) else f"{i+1}."
-            kp_url = f"https://www.kinopoisk.ru/series/{h.kp_id}/"
-            cap_lines = [f"{prefix} <b>{h.title_ru}</b>"]
-            if h.title_en and h.title_en != h.title_ru:
-                cap_lines[0] += f" / <i>{h.title_en}</i>"
-            if h.year:
-                cap_lines[0] += f" ({h.year})"
-            if h.rating_kp:
-                cap_lines.append(f"⭐ КП {h.rating_kp:.1f}")
-            if h.short_description:
-                short = h.short_description if len(h.short_description) <= 200 else h.short_description[:200].rstrip() + "…"
-                cap_lines.append(short)
-            cap_lines.append(f'<a href="{kp_url}">Открыть на Кинопоиске</a>')
-            caption = "\n".join(cap_lines)
-            if h.poster_url:
-                try:
-                    await bot.send_photo(chat_id=chat_id, photo=h.poster_url, caption=caption, parse_mode="HTML")
-                    continue
-                except Exception:
-                    pass
-            await bot.send_message(chat_id, caption, parse_mode="HTML", disable_web_page_preview=False)
+        # Готовим нумерованный список + помечаем те что уже добавлены
+        digits = ["1\u20e3", "2\u20e3", "3\u20e3", "4\u20e3", "5\u20e3", "6\u20e3", "7\u20e3", "8\u20e3", "9\u20e3", "\U0001f51f"]
+        already_added: set[int] = set()
+        async with session_factory() as session:
+            for h in hits[:10]:
+                existing = await repo.get_series_by_kp_id(session, h.kp_id)
+                if existing:
+                    us = await repo.get_user_series(session, tg_user_id, existing.id)
+                    if us:
+                        already_added.add(h.kp_id)
 
-        # Клавиатура для выбора цифрой
+        lines = ["\U0001f914 <b>\u0412\u044b \u0438\u043c\u0435\u0435\u0442\u0435 \u0432 \u0432\u0438\u0434\u0443:</b>", ""]
+        for i, h in enumerate(hits[:10]):
+            prefix = digits[i] if i < len(digits) else f"{i + 1}."
+            mark = " \u2705" if h.kp_id in already_added else ""
+            title_line = f"{prefix} <b>{h.title_ru}</b>"
+            if h.year:
+                title_line += f" ({h.year})"
+            title_line += mark
+            lines.append(title_line)
+            extra_bits = []
+            if h.title_en and h.title_en != h.title_ru:
+                extra_bits.append(f"<i>{h.title_en}</i>")
+            if h.rating_kp:
+                extra_bits.append(f"\u2b50 \u041a\u041f {h.rating_kp:.1f}")
+            kp_url = f"https://www.kinopoisk.ru/series/{h.kp_id}/"
+            extra_bits.append(f'<a href="{kp_url}">\u041a\u041f</a>')
+            lines.append("   " + " \u00b7 ".join(extra_bits))
+            if h.short_description:
+                short = h.short_description if len(h.short_description) <= 140 else h.short_description[:140].rstrip() + "\u2026"
+                lines.append(f"   <i>{short}</i>")
+            lines.append("")
+        caption = "\n".join(lines).rstrip()
+
+        # Media group из постеров (одним сообщением), caption у первого
+        media: list[InputMediaPhoto] = []
+        for h in hits[:10]:
+            if not h.poster_url:
+                continue
+            cap = caption if not media else None  # caption только у первого
+            try:
+                media.append(InputMediaPhoto(media=h.poster_url, caption=cap, parse_mode="HTML" if cap else None))
+            except Exception:
+                pass
+        if len(media) >= 2:
+            try:
+                await bot.send_media_group(chat_id=chat_id, media=media[:10])
+            except Exception as e:
+                logger.warning("send_media_group failed: %s -- fallback to text", e)
+                await bot.send_message(chat_id, caption, parse_mode="HTML", disable_web_page_preview=True)
+        else:
+            await bot.send_message(chat_id, caption, parse_mode="HTML", disable_web_page_preview=True)
+
+        # Клавиатура для выбора цифрой -- одним сообщением
         kb_items = [(h.kp_id, h.title_ru + (f" ({h.year})" if h.year else "")) for h in hits]
         await bot.send_message(
             chat_id,
-            "👇 Какой из них? (или напиши номер цифрой)",
+            "\U0001f447 \u041a\u0430\u043a\u043e\u0439 \u0438\u0437 \u043d\u0438\u0445? (\u0438\u043b\u0438 \u043d\u0430\u043f\u0438\u0448\u0438 \u043d\u043e\u043c\u0435\u0440 \u0446\u0438\u0444\u0440\u043e\u0439)",
             reply_markup=search_results_keyboard(kb_items),
         )
         # FSM: запомним список и ждём цифру
@@ -509,6 +538,17 @@ def make_router(
             await _send_card(
                 message.bot, message.chat.id, series,
                 user_status=us.status, user_rating=us.rating, note=us.notes,
+            )
+        # Bulk-перевод одним нажатием
+        if status == "want" and len(rows) >= 2:
+            await message.answer(
+                "Хочешь начать смотреть все сразу?",
+                reply_markup=bulk_move_keyboard("want", "watching", len(rows)),
+            )
+        elif status == "watching" and len(rows) >= 2:
+            await message.answer(
+                "Отметить все как досмотренные?",
+                reply_markup=bulk_move_keyboard("watching", "watched", len(rows)),
             )
 
     @router.message(Command("list"))
@@ -773,6 +813,47 @@ def make_router(
         sent = await run_weekly_checkin(message.bot, session_factory)
         await message.answer(f"🔔 Опрос отправлен: {sent} сериал(ов).")
 
+
+    # ============== Bulk-перевод статусов ==============
+    @router.callback_query(F.data.startswith("bulk:"))
+    async def cb_bulk(call: CallbackQuery) -> None:
+        _, from_status, to_status = call.data.split(":")
+        async with session_factory() as session:
+            await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            n = await repo.bulk_set_status(session, call.from_user.id, from_status, to_status)
+            await session.commit()
+        await call.answer(f"✅ Переведено: {n}")
+        await call.message.answer(
+            f"✅ Перевёл {n} сериалов в <b>{STATUS_LABELS.get(to_status, to_status)}</b>",
+            parse_mode="HTML",
+        )
+
+    # ============== Текст без префикса /add = поиск ==============
+    # Список текстов reply-кнопок — их игнорим (обрабатываются своими хендлерами)
+    _BUTTON_TEXTS = {
+        "🎬 Добавить", "🎲 Что включить?",
+        "👀 Хочу", "▶️ Смотрю",
+        "✅ Посмотрел", "🔁 Пересмотреть",
+        "💛 Лайки оба", "✨ Подобрать",
+        "📊 Статистика", "ℹ️ Помощь",
+    }
+
+    @router.message(F.text & ~F.text.startswith("/"))
+    async def text_as_search(message: Message, state: FSMContext) -> None:
+        current_state = await state.get_state()
+        if current_state is not None:
+            # В FSM — спец-хендлеры (note, pick, swipe) сработают раньше
+            return
+        text = (message.text or "").strip()
+        if not text or text in _BUTTON_TEXTS:
+            return
+        if len(text) < 2:
+            return
+        await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, text, state=state)
+
     return router
 
 
@@ -801,4 +882,10 @@ async def _add_by_kp_id(
         status = us.status if us else None
         rating = us.rating if us else None
         note = us.notes if us else None
+    if status:
+        await bot.send_message(
+            chat_id,
+            f"💡 <b>{series.title_ru}</b> уже у тебя — статус: {STATUS_LABELS.get(status, status)}.\nМожешь поменять кнопками ниже 👇",
+            parse_mode="HTML",
+        )
     await _send_card(bot, chat_id, series, user_status=status, user_rating=rating, note=note)

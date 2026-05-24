@@ -16,20 +16,27 @@ from sqlalchemy.ext.asyncio import (
 from .models import Base, Pair, Series, User, UserSeries, utcnow
 
 
-def make_engine(db_path: str):
-    return create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False, future=True)
+def make_engine(db_url: str):
+    """Create async engine. Accepts either sqlite+aiosqlite:/// or postgresql+asyncpg://"""
+    kwargs = {"echo": False, "future": True}
+    if db_url.startswith("postgresql"):
+        # Neon/Supabase free tier requires SSL; asyncpg handles it via ssl=True
+        kwargs["connect_args"] = {"ssl": True}
+        kwargs["pool_pre_ping"] = True
+    return create_async_engine(db_url, **kwargs)
 
 
 async def init_db(engine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Lightweight migration: add last_checkin_at if missing (SQLite only)
-        try:
-            await conn.exec_driver_sql(
-                "ALTER TABLE user_series ADD COLUMN last_checkin_at DATETIME"
-            )
-        except Exception:
-            pass  # column already exists
+        # Best-effort migration (works on both SQLite and Postgres)
+        for sql in [
+            "ALTER TABLE user_series ADD COLUMN last_checkin_at TIMESTAMP",
+        ]:
+            try:
+                await conn.exec_driver_sql(sql)
+            except Exception:
+                pass  # column already exists
 
 
 def make_session_factory(engine) -> async_sessionmaker[AsyncSession]:
@@ -217,3 +224,18 @@ async def list_pair_matches(
     )
     result = await session.execute(stmt)
     return result.scalars().all()
+
+async def bulk_set_status(
+    session: AsyncSession, user_id: int, from_status: str, to_status: str
+) -> int:
+    """Перевести все user_series юзера со статусом from_status в to_status. Возвращает число изменённых."""
+    result = await session.execute(
+        select(UserSeries).where(
+            UserSeries.user_id == user_id, UserSeries.status == from_status
+        )
+    )
+    rows = result.scalars().all()
+    for us in rows:
+        us.status = to_status
+    await session.flush()
+    return len(rows)

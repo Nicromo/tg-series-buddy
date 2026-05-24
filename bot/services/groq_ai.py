@@ -1,4 +1,4 @@
-"""Groq AI клиент (OpenAI-совместимый API) — рекомендации, mood-search, vision."""
+"""Groq AI клиент (OpenAI-совместимый API) — рекомендации, mood-поиск, vision."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from typing import Optional
 import httpx
 
 GROQ_BASE = "https://api.groq.com/openai/v1"
-# Vision-capable model (multimodal). For text-only — use Settings.groq_model.
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 logger = logging.getLogger(__name__)
@@ -25,13 +24,7 @@ class SuggestedSeries:
 
 
 class GroqClient:
-    def __init__(
-        self,
-        api_key: str,
-        model: str = "llama-3.3-70b-versatile",
-        *,
-        timeout: float = 30.0,
-    ) -> None:
+    def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile", *, timeout: float = 30.0) -> None:
         self._client = httpx.AsyncClient(
             timeout=timeout,
             base_url=GROQ_BASE,
@@ -58,10 +51,6 @@ class GroqClient:
         return resp.json()["choices"][0]["message"]["content"]
 
     async def vision_recognize_series(self, image_bytes: bytes) -> Optional[str]:
-        """По фотографии скрина/постера/афиши извлекает НАЗВАНИЕ сериала.
-
-        Возвращает строку с названием или None, если не нашёл.
-        """
         b64 = base64.b64encode(image_bytes).decode("ascii")
         payload = {
             "model": VISION_MODEL,
@@ -74,15 +63,12 @@ class GroqClient:
                             "text": (
                                 "На картинке — постер, скриншот или афиша сериала/фильма. "
                                 "Извлеки ТОЛЬКО название (без года, без описания). "
-                                "Если на картинке несколько названий — выбери основное. "
-                                "Если это явно НЕ сериал/фильм — ответь словом NONE. "
-                                "Верни ТОЛЬКО само название, без кавычек, без пояснений."
+                                "Если несколько — выбери основное. "
+                                "Если это явно НЕ сериал/фильм — ответь NONE. "
+                                "Верни ТОЛЬКО само название без кавычек и пояснений."
                             ),
                         },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                        },
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                     ],
                 }
             ],
@@ -96,12 +82,34 @@ class GroqClient:
         except Exception as e:
             logger.warning("Vision recognize failed: %s", e)
             return None
-
         if not text or text.upper().startswith("NONE") or len(text) > 100:
             return None
-        # remove quotes
-        text = text.strip('"\'«»“”').strip()
-        return text or None
+        text = text.strip('"\'').strip()
+        # Strip Russian quote chars manually (avoid escape headaches)
+        for ch in ["«", "»", chr(0x201C), chr(0x201D)]:
+            text = text.replace(ch, "")
+        return text.strip() or None
+
+    async def mood_search(self, mood: str, library_titles: list[str]) -> list[str]:
+        """Из библиотеки юзера выбирает до 5 сериалов под запрос настроения."""
+        if not library_titles:
+            return []
+        system = (
+            "Ты — рекомендатель сериалов. Тебе дают список сериалов из библиотеки "
+            "пользователя и запрос настроения. Верни ТОЛЬКО валидный JSON формата "
+            '{"items":["name1","name2"]} — до 5 названий из СПИСКА, что лучше подходят. '
+            "Используй РОВНО те названия что в списке."
+        )
+        lib = ", ".join(library_titles[:50])
+        user = f"Настроение: {mood}\n\nБиблиотека: {lib}\n\nВерни до 5 в JSON items."
+        try:
+            raw = await self.chat(system, user, json_mode=True)
+            data = json.loads(raw)
+            items = data.get("items", [])
+            return [str(x).strip() for x in items if str(x).strip()][:5]
+        except Exception as e:
+            logger.warning("mood_search failed: %s", e)
+            return []
 
     async def suggest_for_pair(
         self,
@@ -114,18 +122,17 @@ class GroqClient:
         mood_hint: Optional[str] = None,
     ) -> list[SuggestedSeries]:
         system = (
-            "Ты — рекомендатель сериалов для пары. Отдаёшь ТОЛЬКО валидный JSON "
-            'формата {"items":[{"title":"...","year":2020,"why":"..."}]}. '
-            "Title — на русском или оригинальном языке. "
-            "Why — одна короткая фраза почему именно ИМ зайдёт."
+            "Ты — рекомендатель сериалов для пары. Отдай ТОЛЬКО JSON "
+            '{"items":[{"title":"...","year":2020,"why":"..."}]}. '
+            "Title — русский или оригинал. Why — короткая фраза почему ИМ зайдёт."
         )
         bits = []
         if likes_a:
-            bits.append(f"Партнёр A любит: {', '.join(likes_a[:10])}")
+            bits.append(f"Партнёр A лайкнул: {', '.join(likes_a[:10])}")
         if dislikes_a:
             bits.append(f"Партнёру A не зашло: {', '.join(dislikes_a[:5])}")
         if likes_b:
-            bits.append(f"Партнёр B любит: {', '.join(likes_b[:10])}")
+            bits.append(f"Партнёр B лайкнул: {', '.join(likes_b[:10])}")
         if dislikes_b:
             bits.append(f"Партнёру B не зашло: {', '.join(dislikes_b[:5])}")
         if already_in_queue:
@@ -135,12 +142,11 @@ class GroqClient:
 
         user = (
             ("\n".join(bits) if bits else "Истории мало — предложи популярные сериалы.")
-            + "\n\nПредложи 3 сериала которые зайдут ОБОИМ. "
-            "Верни JSON с полем items: массив объектов {title, year, why}."
+            + "\n\nПредложи 3 сериала которые зайдут ОБОИМ. JSON items."
         )
 
-        raw = await self.chat(system, user, json_mode=True)
         try:
+            raw = await self.chat(system, user, json_mode=True)
             data = json.loads(raw)
             items = data.get("items", [])
             result: list[SuggestedSeries] = []
@@ -155,6 +161,6 @@ class GroqClient:
                     year = None
                 result.append(SuggestedSeries(title=title, year=year, why=it.get("why") or ""))
             return result
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning("Groq returned non-JSON: %s — raw=%s", e, raw[:200])
+        except Exception as e:
+            logger.warning("Groq suggest failed: %s", e)
             return []

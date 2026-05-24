@@ -70,10 +70,11 @@ async def main() -> None:
     settings = Settings.from_env()
     logging.info(
         "Starting bot. DB: %s, API: %s, Groq: %s",
-        settings.db_path, settings.kp_api_base, "yes" if settings.groq_api_key else "no",
+        settings.db_url.split('@')[-1] if '@' in settings.db_url else settings.db_url,
+        settings.kp_api_base, "yes" if settings.groq_api_key else "no",
     )
 
-    engine = make_engine(str(settings.db_path))
+    engine = make_engine(settings.db_url)
     await init_db(engine)
     session_factory = make_session_factory(engine)
 
@@ -87,7 +88,7 @@ async def main() -> None:
 
     port = int(os.getenv("PORT", "8080"))
     http_runner = await start_http_server(port)
-    scheduler = start_scheduler(bot, session_factory)
+    scheduler = start_scheduler(bot, session_factory, kp=kp)
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
