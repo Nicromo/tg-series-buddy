@@ -41,6 +41,7 @@ async def init_db(engine) -> None:
             "ALTER TABLE series ADD COLUMN IF NOT EXISTS premiere_world VARCHAR(16)",
             "ALTER TABLE series ADD COLUMN IF NOT EXISTS premiere_russia VARCHAR(16)",
             "ALTER TABLE series ADD COLUMN IF NOT EXISTS trailer_url VARCHAR(512)",
+            "ALTER TABLE user_series ADD COLUMN IF NOT EXISTS current_episode VARCHAR(32)",
         ]:
             try:
                 await conn.exec_driver_sql(sql)
@@ -267,6 +268,21 @@ async def clear_user_series_rating(
     us.rating = None
     await session.flush()
     return True
+
+
+async def set_user_series_progress(
+    session: AsyncSession, user_id: int, series_id: int, progress: Optional[str]
+) -> Optional[UserSeries]:
+    """Личный прогресс просмотра — НЕ зеркалится партнёру (каждый смотрит
+    в своём темпе). None — сбросить."""
+    us = await get_user_series(session, user_id, series_id)
+    if us is None:
+        us = UserSeries(user_id=user_id, series_id=series_id, status="watching", current_episode=progress)
+        session.add(us)
+    else:
+        us.current_episode = progress
+    await session.flush()
+    return us
 
 
 async def toggle_notify_releases(

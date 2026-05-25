@@ -418,6 +418,120 @@ def make_router(
                 ]]),
             )
 
+    # ============== Прогресс серий (prog:) ==============
+    def _increment_episode(progress: Optional[str]) -> str:
+        """S1E5 → S1E6; '12' → '13'; None → 'S1E1'."""
+        if not progress:
+            return "S1E1"
+        m = re.match(r"S(\d+)E(\d+)", progress, re.IGNORECASE)
+        if m:
+            return f"S{m.group(1)}E{int(m.group(2)) + 1}"
+        m = re.match(r"(\d+)", progress.strip())
+        if m:
+            return str(int(m.group(1)) + 1)
+        return "S1E1"
+
+    def _increment_season(progress: Optional[str]) -> str:
+        """S1E5 → S2E1; None → 'S2E1'."""
+        if not progress:
+            return "S2E1"
+        m = re.match(r"S(\d+)E\d+", progress, re.IGNORECASE)
+        if m:
+            return f"S{int(m.group(1)) + 1}E1"
+        return "S2E1"
+
+    def _progress_keyboard(series_id: int, current: Optional[str]):
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        rows = [
+            [
+                IKB(text="📺 +1 серия", callback_data=f"prog:ep:{series_id}"),
+                IKB(text="🎬 +1 сезон", callback_data=f"prog:sn:{series_id}"),
+            ],
+            [
+                IKB(text="✏️ Ввести вручную", callback_data=f"prog:set:{series_id}"),
+            ],
+        ]
+        if current:
+            rows.append([IKB(text="🔄 Сбросить прогресс", callback_data=f"prog:reset:{series_id}")])
+        return IKM(inline_keyboard=rows)
+
+    class ProgressFSM(StatesGroup):
+        waiting = State()
+
+    @router.callback_query(F.data.startswith("prog:"))
+    async def cb_progress(call: CallbackQuery, state: FSMContext) -> None:
+        parts = call.data.split(":")
+        action = parts[1]
+        if action not in ("ep", "sn", "set", "reset", "show"):
+            await call.answer()
+            return
+        series_id = int(parts[2])
+
+        if action == "set":
+            await state.update_data(series_id=series_id)
+            await state.set_state(ProgressFSM.waiting)
+            await call.answer()
+            await call.message.answer(
+                "✏️ Напиши прогресс одним сообщением.\n"
+                "Например: <code>S2E5</code> или <code>12</code> серий. /cancel чтобы отменить.",
+                parse_mode="HTML",
+            )
+            return
+
+        async with session_factory() as session:
+            us = await repo.get_user_series(session, call.from_user.id, series_id)
+            series = await session.get(Series, series_id)
+            current = us.current_episode if us else None
+            if action == "ep":
+                new_value = _increment_episode(current)
+            elif action == "sn":
+                new_value = _increment_season(current)
+            elif action == "reset":
+                new_value = None
+            else:
+                new_value = current
+            await repo.set_user_series_progress(session, call.from_user.id, series_id, new_value)
+            await session.commit()
+
+        title = series.title_ru if series else "сериал"
+        if new_value:
+            await call.answer(f"📺 {new_value}")
+            await call.message.answer(
+                f"📺 <b>{title}</b>: <code>{new_value}</code>",
+                parse_mode="HTML",
+                reply_markup=_progress_keyboard(series_id, new_value),
+            )
+        else:
+            await call.answer("🔄 Прогресс сброшен")
+            await call.message.answer(
+                f"🔄 <b>{title}</b>: прогресс сброшен.",
+                parse_mode="HTML",
+                reply_markup=_progress_keyboard(series_id, None),
+            )
+
+    @router.message(ProgressFSM.waiting, Command("cancel"))
+    async def progress_cancel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer("Отменил.")
+
+    @router.message(ProgressFSM.waiting)
+    async def progress_set(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        series_id = data.get("series_id")
+        text = (message.text or "").strip()
+        if not series_id or not text or len(text) > 32:
+            await message.answer("Странный ввод. Попробуй <code>S2E5</code> или /cancel", parse_mode="HTML")
+            return
+        async with session_factory() as session:
+            await repo.set_user_series_progress(session, message.from_user.id, series_id, text)
+            await session.commit()
+        await state.clear()
+        await message.answer(
+            f"📺 Прогресс сохранён: <code>{text}</code>",
+            parse_mode="HTML",
+            reply_markup=_progress_keyboard(series_id, text),
+        )
+
     @router.callback_query(F.data.startswith("notify:"))
     async def cb_notify_toggle(call: CallbackQuery) -> None:
         series_id = int(call.data.split(":")[1])
@@ -889,90 +1003,157 @@ def make_router(
         await call.answer()
 
     # ============== Списки с пагинацией ==============
-    async def _send_list(message: Message, status: str, empty_msg: str, *, header: str = "") -> None:
+    _PAGE_SIZE = 10
+    _SORT_LABELS = {"date": "📅 Дата", "rating": "⭐ Рейтинг", "year": "🆕 Год"}
+
+    _HEADERS = {
+        "want":         ("👀 <b>Наш общий «хочу посмотреть»:</b>", "Очередь пустая. Добавь /add &lt;название&gt;"),
+        "watching":     ("▶️ <b>Смотрим сейчас:</b>", "Сейчас ничего не смотрим."),
+        "watched":      ("✅ <b>Досмотрено:</b>", "Ещё ничего не досмотрели до конца."),
+        "want_rewatch": ("🔁 <b>Хотим пересмотреть:</b>", "Список пересмотра пуст. Жми 🔁 в карточке досмотренного."),
+    }
+
+    def _sort_rows(rows: list, sort_key: str) -> list:
+        """Сортирует [(UserSeries, Series), ...]. По умолчанию — по дате (updated_at DESC)."""
+        if sort_key == "rating":
+            return sorted(rows, key=lambda x: (x[1].rating_kp or 0), reverse=True)
+        if sort_key == "year":
+            return sorted(rows, key=lambda x: (x[1].year or 0), reverse=True)
+        # 'date' по умолчанию: свежие добавления сверху
+        return sorted(rows, key=lambda x: (x[0].updated_at or x[0].id), reverse=True)
+
+    async def _render_list(
+        bot: Bot,
+        chat_id: int,
+        tg_user_id: int,
+        status: str,
+        *,
+        page: int = 0,
+        sort_key: str = "date",
+    ) -> None:
+        header, empty_msg = _HEADERS.get(status, ("Список", "Пусто."))
         async with session_factory() as session:
-            user = await repo.get_or_create_user(
-                session, tg_id=message.from_user.id,
-                username=message.from_user.username, full_name=message.from_user.full_name,
-            )
+            user = await repo.get_or_create_user(session, tg_id=tg_user_id, username=None, full_name=None)
             rows = await repo.list_user_series(session, user.id, status=status)
         if not rows:
-            await message.answer(empty_msg)
+            await bot.send_message(chat_id, empty_msg)
             return
 
-        items = rows[:10]
+        rows = _sort_rows(rows, sort_key)
+        total = len(rows)
+        total_pages = (total + _PAGE_SIZE - 1) // _PAGE_SIZE
+        page = max(0, min(page, total_pages - 1))
+        start = page * _PAGE_SIZE
+        items = rows[start:start + _PAGE_SIZE]
+
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
 
-        # Галерея постеров (без подписи — заголовок отдельным сообщением)
+        # Галерея постеров для текущей страницы
         media = [InputMediaPhoto(media=s.poster_url) for _, s in items if s.poster_url]
         if len(media) >= 2:
             try:
-                await message.bot.send_media_group(message.chat.id, media[:10])
+                await bot.send_media_group(chat_id, media[:10])
             except Exception as e:
-                logger.warning("send_media_group failed for /%s list: %s", status, e)
+                logger.warning("send_media_group failed for /%s page=%s: %s", status, page, e)
 
         # Текст: заголовок + пронумерованный список
-        title = header or "Список"
-        lines = [f"{title}  ·  {len(rows)} шт.", ""]
+        page_label = f" · стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+        lines = [f"{header}  ·  {total} шт.{page_label}", ""]
         for i, (us, s) in enumerate(items, 1):
             marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
             year_str = f" ({s.year})" if s.year else ""
             rating_str = f" ⭐{s.rating_kp:.1f}" if s.rating_kp else ""
             lines.append(f"{marker} <b>{s.title_ru}</b>{year_str}{rating_str}")
-        if len(rows) > 10:
-            lines.append("")
-            lines.append(f"<i>… показал первые 10 из {len(rows)}. /find для поиска.</i>")
         lines.append("")
-        lines.append("<i>👇 Жми номер чтобы открыть полную карточку</i>")
+        lines.append(f"<i>Сортировка: {_SORT_LABELS.get(sort_key, sort_key)} · 👇 жми номер чтобы открыть</i>")
 
-        # Кнопки 1-N (по 5 в ряд) — иконка глаза подсказывает «открыть»
-        btn_rows: list[list] = []
+        # 1) Ряд: кнопки сортировки (текущая отмечена ✓)
+        sort_row = []
+        for key, label in _SORT_LABELS.items():
+            text = ("• " + label) if key == sort_key else label
+            sort_row.append(IKB(text=text, callback_data=f"ls:{status}:{key}"))
+
+        # 2) Ряды: глаза 👁 1..N (по 5 в ряд)
+        eye_rows: list[list] = []
         cur: list = []
         for i, (_, s) in enumerate(items, 1):
             cur.append(IKB(text=f"👁 {i}", callback_data=f"open:{s.id}"))
             if len(cur) >= 5:
-                btn_rows.append(cur)
+                eye_rows.append(cur)
                 cur = []
         if cur:
-            btn_rows.append(cur)
+            eye_rows.append(cur)
 
-        # Доп. кнопки
+        # 3) Пагинация (если >1 страницы)
+        pagination_row = []
+        if total_pages > 1:
+            if page > 0:
+                pagination_row.append(IKB(text="⬅️ Назад", callback_data=f"lp:{status}:{sort_key}:{page - 1}"))
+            pagination_row.append(IKB(text=f"{page + 1}/{total_pages}", callback_data="lp:noop"))
+            if page < total_pages - 1:
+                pagination_row.append(IKB(text="Вперёд ➡️", callback_data=f"lp:{status}:{sort_key}:{page + 1}"))
+
+        # 4) Доп. экшены (только на первой странице чтоб не перегружать)
         action_row = []
-        if status == "want":
-            action_row.append(IKB(text="🎲 Случайный", callback_data="open_random:want"))
-            if len(rows) >= 2:
-                action_row.append(IKB(text=f"▶️ Все в смотрю ({len(rows)})", callback_data="bulk:want:watching"))
-        elif status == "watching" and len(rows) >= 2:
-            action_row.append(IKB(text=f"✅ Все досмотрел ({len(rows)})", callback_data="bulk:watching:watched"))
+        if page == 0:
+            if status == "want":
+                action_row.append(IKB(text="🎲 Случайный", callback_data="open_random:want"))
+                if total >= 2:
+                    action_row.append(IKB(text=f"▶️ Все в смотрю ({total})", callback_data="bulk:want:watching"))
+            elif status == "watching" and total >= 2:
+                action_row.append(IKB(text=f"✅ Все досмотрел ({total})", callback_data="bulk:watching:watched"))
+
+        btn_rows = [sort_row, *eye_rows]
+        if pagination_row:
+            btn_rows.append(pagination_row)
         if action_row:
             btn_rows.append(action_row)
 
-        await message.answer(
+        await bot.send_message(
+            chat_id,
             "\n".join(lines),
             parse_mode="HTML",
             reply_markup=IKM(inline_keyboard=btn_rows),
             disable_web_page_preview=True,
         )
 
+    @router.callback_query(F.data.startswith("lp:"))
+    async def cb_list_page(call: CallbackQuery) -> None:
+        parts = call.data.split(":")
+        if len(parts) < 4 or parts[1] == "noop":
+            await call.answer()
+            return
+        _, status, sort_key, page_s = parts
+        await call.answer()
+        await _render_list(
+            call.bot, call.message.chat.id, call.from_user.id, status,
+            page=int(page_s), sort_key=sort_key,
+        )
+
+    @router.callback_query(F.data.startswith("ls:"))
+    async def cb_list_sort(call: CallbackQuery) -> None:
+        _, status, sort_key = call.data.split(":")
+        await call.answer(f"Сортировка: {_SORT_LABELS.get(sort_key, sort_key)}")
+        await _render_list(
+            call.bot, call.message.chat.id, call.from_user.id, status,
+            page=0, sort_key=sort_key,
+        )
+
     @router.message(Command("list"))
     async def cmd_list(message: Message) -> None:
-        await _send_list(
-            message, "want",
-            "Очередь пустая. Добавь /add &lt;название&gt;",
-            header="👀 <b>Наш общий «хочу посмотреть»:</b>",
-        )
+        await _render_list(message.bot, message.chat.id, message.from_user.id, "want")
 
     @router.message(Command("watching"))
     async def cmd_watching(message: Message) -> None:
-        await _send_list(message, "watching", "Сейчас ничего не смотришь.", header="▶️ <b>Смотрим сейчас:</b>")
+        await _render_list(message.bot, message.chat.id, message.from_user.id, "watching")
 
     @router.message(Command("watched"))
     async def cmd_watched(message: Message) -> None:
-        await _send_list(message, "watched", "Ещё ничего не досмотрел до конца.", header="✅ <b>Досмотрено:</b>")
+        await _render_list(message.bot, message.chat.id, message.from_user.id, "watched")
 
     @router.message(Command("rewatch"))
     async def cmd_rewatch(message: Message) -> None:
-        await _send_list(message, "want_rewatch", "Список пересмотра пуст. Жми 🔁 в карточке досмотренного сериала.", header="🔁 <b>Пересмотреть:</b>")
+        await _render_list(message.bot, message.chat.id, message.from_user.id, "want_rewatch")
 
     # Кнопки главного меню
     @router.message(F.text == "👀 Хочу")
@@ -1145,59 +1326,128 @@ def make_router(
     async def btn_suggest(message: Message) -> None:
         await cmd_suggest(message)
 
-    # ============== /swipe — игровой режим ==============
+    # ============== /swipe — Tinder для новых сериалов ==============
     @router.message(Command("swipe"))
     async def cmd_swipe(message: Message, state: FSMContext) -> None:
+        await message.bot.send_chat_action(message.chat.id, action="typing")
         async with session_factory() as session:
-            rows = await repo.list_user_series(session, message.from_user.id, status="want")
-        if not rows:
-            await message.answer("🃏 Очередь пустая — нечего свайпать.")
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            # Что уже знаем (мы + партнёр) — не показывать
+            my_rows = await repo.list_user_series(session, user.id, status=None)
+            partner_rows: list = []
+            if user.pair_id:
+                members = await repo.get_pair_members(session, user.pair_id)
+                for m in members:
+                    if m.id != user.id:
+                        partner_rows.extend(await repo.list_user_series(session, m.id, status=None))
+            known_kp_ids = {s.kp_id for _, s in (my_rows + partner_rows)}
+
+            # Достаём топ-жанры из лайков для персонализации
+            genre_counter: Counter = Counter()
+            for us, s in my_rows + partner_rows:
+                if us.status != "dropped" and s.genres:
+                    for g in s.genres.split(","):
+                        g = g.strip()
+                        if g:
+                            genre_counter[g] += 1
+            top_genres = [g for g, _ in genre_counter.most_common(3)]
+
+        # Тянем свежие сериалы из KP — сначала с подходящими жанрами, потом без
+        candidates: list = []
+        try:
+            if top_genres:
+                hits = await kp.get_upcoming_series(genres=top_genres, limit=25)
+                candidates.extend(h for h in hits if h.kp_id not in known_kp_ids and h.poster_url)
+            if len(candidates) < 5:
+                hits = await kp.get_upcoming_series(limit=25)
+                for h in hits:
+                    if h.kp_id not in known_kp_ids and h.poster_url and h.kp_id not in {c.kp_id for c in candidates}:
+                        candidates.append(h)
+        except Exception as e:
+            logger.warning("kp.get_upcoming_series failed: %s", e)
+
+        if not candidates:
+            await message.answer(
+                "🃏 Не нашёл новых сериалов для свайпа. Попробуй позже или используй /suggest.",
+            )
             return
-        random.shuffle(rows)
-        queue = [(us.series_id, s.title_ru) for us, s in rows[:10]]
+
+        random.shuffle(candidates)
+        queue = [(c.kp_id, c.title_ru) for c in candidates[:10]]
         await state.update_data(queue=queue, idx=0)
         await state.set_state(SwipeFSM.swiping)
-        await message.answer(f"🎮 <b>Свайп-вечер</b>\n\nПокажу {len(queue)} сериалов. ❤️ — хочу включить, 👎 — пропустить.", parse_mode="HTML")
-        await _send_swipe_card(message.bot, message.chat.id, queue[0][0], 0, session_factory)
+        genres_hint = f" с упором на: {', '.join(top_genres)}" if top_genres else ""
+        await message.answer(
+            f"🃏 <b>Свайп-вечер</b>\n\n"
+            f"Покажу {len(queue)} свежих сериалов{genres_hint}.\n"
+            f"❤️ — добавить в «👀 Хочу», 👎 — пропустить.",
+            parse_mode="HTML",
+        )
+        await _send_swipe_card_by_kp(message.bot, message.chat.id, queue[0][0], 0)
 
     @router.callback_query(SwipeFSM.swiping, F.data.startswith("sw:"))
     async def cb_swipe(call: CallbackQuery, state: FSMContext) -> None:
-        _, action, series_id_s, queue_idx_s = call.data.split(":")
+        _, action, kp_id_s, queue_idx_s = call.data.split(":")
         queue_idx = int(queue_idx_s)
         data = await state.get_data()
         queue: list = data.get("queue", [])
         if action == "stop":
             await state.clear()
-            await call.message.answer("🏁 Свайп окончен.")
+            await call.message.answer("🏁 Свайп окончен. Что отметил «хочу» — теперь в /list 👀")
             await call.answer()
             return
         if action == "yes":
-            series_id = int(series_id_s)
-            async with session_factory() as session:
-                # «Хочу» = добавить в общий want пары (set_user_series_status зеркалит)
-                await repo.set_user_series_status(session, call.from_user.id, series_id, "want")
-                await session.commit()
-            await call.answer("👀 Хочу!")
+            kp_id = int(kp_id_s)
+            await _add_by_kp_id(
+                call.bot, call.message.chat.id, call.from_user.id, kp_id,
+                session_factory, kp, silent=True,
+            )
+            await call.answer("👀 Добавил в «Хочу»!")
         else:
             await call.answer("👎 Скип")
         next_idx = queue_idx + 1
         if next_idx >= len(queue):
             await state.clear()
-            await call.message.answer("🏁 Все варианты показал! Что отметил «хочу» — теперь в /list 👀")
+            await call.message.answer("🏁 Все варианты показал! Открой /list 👀")
             return
         await state.update_data(idx=next_idx)
-        await _send_swipe_card(call.bot, call.message.chat.id, queue[next_idx][0], next_idx, session_factory)
+        await _send_swipe_card_by_kp(call.bot, call.message.chat.id, queue[next_idx][0], next_idx)
 
-    async def _send_swipe_card(bot: Bot, chat_id: int, series_id: int, idx: int, sf: async_sessionmaker) -> None:
-        async with sf() as session:
-            series = await session.get(Series, series_id)
-            if series is None:
-                return
-        caption = f"#{idx + 1} · {_format_caption(series)}"
-        kb = swipe_keyboard(series_id, idx)
-        if series.poster_url:
+    async def _send_swipe_card_by_kp(bot: Bot, chat_id: int, kp_id: int, idx: int) -> None:
+        """Свайп-карточка по kp_id — не нужно сначала добавлять в БД."""
+        try:
+            details = await kp.get_details(kp_id)
+        except Exception as e:
+            logger.warning("KP details failed for swipe %s: %s", kp_id, e)
+            return
+        rating_bits = []
+        if details.rating_kp:
+            rating_bits.append(f"⭐ КП {details.rating_kp:.1f}")
+        if details.rating_imdb:
+            rating_bits.append(f"IMDb {details.rating_imdb:.1f}")
+        desc = (details.description_ru or "")[:400]
+        if details.description_ru and len(details.description_ru) > 400:
+            desc += "…"
+        lines = [
+            f"#{idx + 1} · 🎬 <b>{details.title_ru}</b>",
+            f"({details.year})" if details.year else "",
+            " · ".join(rating_bits),
+            f"🎭 {', '.join(details.genres[:4])}" if details.genres else "",
+            "",
+            desc,
+        ]
+        caption = "\n".join(l for l in lines if l)
+        # swipe_keyboard принимает series_id — но мы пока без БД, шлём kp_id
+        kb = swipe_keyboard(kp_id, idx)
+        if details.poster_url:
             try:
-                await bot.send_photo(chat_id=chat_id, photo=series.poster_url, caption=caption, parse_mode="HTML", reply_markup=kb)
+                await bot.send_photo(
+                    chat_id=chat_id, photo=details.poster_url,
+                    caption=caption, parse_mode="HTML", reply_markup=kb,
+                )
                 return
             except Exception:
                 pass
@@ -1228,6 +1478,7 @@ def make_router(
             user_rating=us.rating if us else None,
             note=us.notes if us else None,
             notify_releases=bool(us and us.notify_releases),
+            progress=us.current_episode if us else None,
         )
 
     @router.callback_query(F.data.startswith("open_random:"))
@@ -1244,6 +1495,7 @@ def make_router(
             call.bot, call.message.chat.id, series,
             user_status=us.status, user_rating=us.rating, note=us.notes,
             notify_releases=bool(us.notify_releases),
+            progress=us.current_episode,
         )
 
     # ============== Bulk-перевод статусов ==============

@@ -61,6 +61,7 @@ def format_caption(
     status: Optional[str] = None,
     rating: Optional[str] = None,  # deprecated, оставлено ради бинарной совместимости
     note: Optional[str] = None,
+    progress: Optional[str] = None,
 ) -> str:
     """Подпись под карточкой сериала. Чистая функция — для тестов."""
     lines: list[str] = []
@@ -111,8 +112,11 @@ def format_caption(
         lines.append(desc)
 
     if status:
+        line = "• " + STATUS_LABELS.get(status, status)
+        if progress and status in ("watching", "want_rewatch"):
+            line += f" · 📺 {progress}"
         lines.append("")
-        lines.append("• " + STATUS_LABELS.get(status, status))
+        lines.append(line)
 
     if getattr(s, "watch_options_json", None):
         try:
@@ -139,8 +143,9 @@ async def send_card(
     user_rating: Optional[str] = None,
     note: Optional[str] = None,
     notify_releases: bool = False,
+    progress: Optional[str] = None,
 ) -> None:
-    caption = format_caption(series, status=user_status, rating=user_rating, note=note)
+    caption = format_caption(series, status=user_status, rating=user_rating, note=note, progress=progress)
     # «В списках» = есть хоть какая-то связь с сериалом (статус/оценка/заметка)
     in_list = bool(user_status or user_rating or note)
     kb = card_keyboard(
@@ -149,6 +154,7 @@ async def send_card(
         is_watched=user_status == "watched",
         is_in_list=in_list,
         notify_releases=notify_releases,
+        is_watching=user_status == "watching",
     )
     if series.poster_url:
         try:
@@ -262,10 +268,11 @@ async def add_by_kp_id(
             parse_mode="HTML",
         )
     notify = bool(us and us.notify_releases) if us else False
+    prog = us.current_episode if us else None
     await send_card(
         bot, chat_id, series,
         user_status=status, user_rating=rating, note=note,
-        notify_releases=notify,
+        notify_releases=notify, progress=prog,
     )
     return series, not was_existing
 

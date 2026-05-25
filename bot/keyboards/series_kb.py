@@ -12,12 +12,14 @@ def card_keyboard(
     is_watched: bool = False,
     is_in_list: bool = False,
     notify_releases: bool = False,
+    is_watching: bool = False,
 ) -> InlineKeyboardMarkup:
     """Кнопки под карточкой сериала.
 
     is_in_list — если есть UserSeries запись, показываем «🗑 Убрать» чтобы
     можно было удалить сериал из своих списков (вернёт в «не знаком»).
     notify_releases — текущее состояние подписки на премьеры/сезоны.
+    is_watching — показать кнопку «📺 Прогресс серий».
     """
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -45,6 +47,12 @@ def card_keyboard(
             InlineKeyboardButton(text="📤 Поделиться", callback_data=f"share:{series_id}"),
         ]
     )
+
+    # Прогресс серий — только когда смотрим
+    if is_watching:
+        rows.append(
+            [InlineKeyboardButton(text="📺 Прогресс серий", callback_data=f"prog:{series_id}")]
+        )
 
     # Кнопка трейлера ВСЕГДА — если YouTube-id нет, фолбэк на TG-канал
     rows.append(

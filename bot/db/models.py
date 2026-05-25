@@ -109,4 +109,8 @@ class UserSeries(Base):
     # Подписка: уведомлять о новых сезонах / премьере. По умолчанию выключено.
     notify_releases: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # Прогресс просмотра — текст в формате «S1E5» или просто число серий.
+    # Личный для каждого члена пары (не зеркалится).
+    current_episode: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
