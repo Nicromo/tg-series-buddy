@@ -325,6 +325,16 @@ def make_router(session_factory: async_sessionmaker) -> Router:
                 parse_mode="HTML",
             )
 
+    def _title_looks_broken(t: str) -> bool:
+        """Эвристика на сломанный UTF-8: «Ð», «Ñ» подряд — это типичная
+        mojibake от `.encode().decode('unicode_escape')` ошибки."""
+        if not t:
+            return True
+        # Если в строке нет ни одного нормального буквенно-цифрового символа,
+        # либо >50% — символы из «mojibake» диапазона
+        bad = sum(1 for ch in t if ch in "ÐÑ°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö")
+        return bad >= 3 and bad / max(1, len(t)) > 0.4
+
     @router.message(Command("subs"))
     async def cmd_subs(message: Message) -> None:
         async with session_factory() as session:
@@ -340,6 +350,25 @@ def make_router(session_factory: async_sessionmaker) -> Router:
                 parse_mode="HTML",
             )
             return
+
+        # Чиним сломанные title — дёргаем RSS feed (один запрос на канал)
+        fixed = 0
+        for s in subs:
+            if _title_looks_broken(s.channel_title):
+                try:
+                    from ..services.youtube_rss import _fetch_channel_title
+                    fresh = await _fetch_channel_title(s.channel_id)
+                    if fresh and not _title_looks_broken(fresh):
+                        async with session_factory() as session:
+                            db_s = await session.get(YoutubeSubscription, s.id)
+                            if db_s:
+                                db_s.channel_title = fresh
+                                await session.commit()
+                                s.channel_title = fresh
+                                fixed += 1
+                except Exception:
+                    pass
+
         lines = [f"📺 <b>YouTube подписки ({len(subs)}):</b>", ""]
         rows = []
         for i, s in enumerate(subs, 1):
@@ -349,6 +378,8 @@ def make_router(session_factory: async_sessionmaker) -> Router:
             )
             rows.append([InlineKeyboardButton(text=f"❌ {i}. Отписаться от {s.channel_title[:25]}", callback_data=f"ytunsub:{s.id}")])
         lines.append("")
+        if fixed:
+            lines.append(f"<i>🔧 Подчинил {fixed} названий из старых подписок</i>")
         lines.append("<i>Жми ❌ чтобы отписаться</i>")
         await message.answer(
             "\n".join(lines),

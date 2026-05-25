@@ -98,7 +98,9 @@ async def resolve_channel(url_or_handle: str) -> Optional[ChannelInfo]:
 
 
 async def _resolve_handle(handle: str) -> Optional[ChannelInfo]:
-    """@handle → channel_id через парсинг HTML страницы канала."""
+    """@handle → channel_id через парсинг HTML страницы канала.
+    Title берём из RSS feed (там UTF-8 в чистом виде, без HTML/JSON escape).
+    """
     url = f"https://www.youtube.com/{handle}"
     headers = {"User-Agent": _UA, "Cookie": _CONSENT_COOKIE, "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"}
     try:
@@ -121,15 +123,23 @@ async def _resolve_handle(handle: str) -> Optional[ChannelInfo]:
                     break
             if not ch_id:
                 return None
-            # Title из meta или из <title>
-            title = None
-            m = re.search(r'<meta name="title" content="([^"]+)"', html)
-            if m:
-                title = m.group(1)
-            else:
-                m = re.search(r'"channelMetadataRenderer":\{"title":"([^"]+)"', html)
+            # Title — самый надёжно из RSS feed (там корректный UTF-8).
+            # На HTML-странице YouTube строки JSON могут содержать \uXXXX,
+            # которые надо парсить через json.loads — НЕ через unicode_escape
+            # (ломает кириллические байты).
+            title = await _fetch_channel_title(ch_id)
+            if not title:
+                m = re.search(r'<meta name="title" content="([^"]+)"', html)
                 if m:
-                    title = m.group(1).encode("utf-8").decode("unicode_escape", errors="ignore")
+                    title = m.group(1)
+            if not title:
+                m = re.search(r'"channelMetadataRenderer":\{"title":"((?:[^"\\]|\\.)+)"', html)
+                if m:
+                    try:
+                        import json as _json
+                        title = _json.loads(f'"{m.group(1)}"')
+                    except Exception:
+                        title = m.group(1)
             return ChannelInfo(channel_id=ch_id, title=title or handle)
     except Exception as e:
         logger.warning("YT handle resolve %s failed: %s", handle, e)
