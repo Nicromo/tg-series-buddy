@@ -4,12 +4,23 @@ from __future__ import annotations
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ..db import repository as repo
 from ..db.models import Pair, Series
 from ..keyboards.main_menu import main_menu
+
+
+class JoinPairFSM(StatesGroup):
+    waiting_code = State()
 
 WELCOME = (
     "🛋️ <b>Диванные критики</b>\n"
@@ -115,8 +126,13 @@ def make_router(session_factory: async_sessionmaker) -> Router:
     async def cmd_menu(message: Message) -> None:
         await message.answer("Меню обновлено 👇", reply_markup=main_menu())
 
+    def _join_code_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➕ Ввести код партнёра", callback_data="pair:enter"),
+        ]])
+
     @router.message(Command("pair"))
-    async def cmd_pair(message: Message) -> None:
+    async def cmd_pair(message: Message, state: FSMContext = None) -> None:
         parts = (message.text or "").split(maxsplit=1)
         async with session_factory() as session:
             user = await repo.get_or_create_user(
@@ -127,31 +143,132 @@ def make_router(session_factory: async_sessionmaker) -> Router:
             )
 
             if len(parts) == 1:
+                # /pair без аргумента
                 if user.pair_id:
                     pair = await session.get(Pair, user.pair_id)
+                    members = await repo.get_pair_members(session, user.pair_id)
                     code = pair.invite_code if pair else "(ошибка)"
-                else:
-                    pair = await repo.create_pair_for_user(session, user)
-                    code = pair.invite_code
-                await session.commit()
+                    # Авто-sync существующих want/watching между членами
+                    created = await repo.sync_pair_series(session, user.pair_id)
+                    await session.commit()
+
+                    member_lines = []
+                    for m in members:
+                        marker = "👤" if m.id == user.id else "👥"
+                        label = m.full_name or (f"@{m.username}" if m.username else f"id={m.id}")
+                        member_lines.append(f"{marker} {label}")
+
+                    text_lines = [
+                        f"👫 <b>Вы в паре</b> ({len(members)} чел.)",
+                        "",
+                        *member_lines,
+                        "",
+                    ]
+                    if created > 0:
+                        text_lines.append(
+                            f"🔄 Синхронизировал списки — у партнёра появилось "
+                            f"<b>{created}</b> новых сериала(ов) в «хочу/смотрю»."
+                        )
+                        text_lines.append("")
+                    text_lines.append(f"🔗 Код для приглашения ещё одного: <code>{code}</code>")
+                    await message.answer(
+                        "\n".join(text_lines),
+                        parse_mode="HTML",
+                    )
+                    return
+
+                # Юзер ещё не в паре — спрашиваем что он хочет
                 await message.answer(
-                    f"🔗 Твой инвайт-код: <code>{code}</code>\n\n"
-                    f"Перешли его жене/партнёру. Они напишут:\n"
-                    f"<code>/pair {code}</code>",
+                    "👫 <b>Создать пару с партнёром</b>\n\n"
+                    "Тебе нужно:\n"
+                    "1️⃣ <b>Получить мой код</b> — отправить партнёру → он введёт его у себя\n"
+                    "2️⃣ Или <b>Ввести код партнёра</b> — если он уже отправил свой\n\n"
+                    "Что делаем?",
                     parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🔗 Дай мой код", callback_data="pair:mycode")],
+                        [InlineKeyboardButton(text="➕ Ввести код партнёра", callback_data="pair:enter")],
+                    ]),
                 )
                 return
 
+            # /pair <code>
             code = parts[1].strip()
             pair = await repo.join_pair_by_code(session, user, code)
             if pair is None:
                 await message.answer("❌ Код не найден. Проверь правильность.")
                 return
+            # Sync существующих want/watching обоих
+            created = await repo.sync_pair_series(session, pair.id)
             await session.commit()
+            extra = f"\n🔄 Синхронизировал списки — у вас обоих появилось <b>{created}</b> новых сериала(ов)." if created else ""
             await message.answer(
                 "✅ Готово, вы в одной паре!\n"
                 "Теперь /match покажет ваши общие лайки 💛"
+                + extra,
+                parse_mode="HTML",
             )
+
+    @router.callback_query(F.data == "pair:mycode")
+    async def cb_pair_mycode(call: CallbackQuery) -> None:
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            if user.pair_id:
+                pair = await session.get(Pair, user.pair_id)
+                code = pair.invite_code if pair else "(ошибка)"
+            else:
+                pair = await repo.create_pair_for_user(session, user)
+                code = pair.invite_code
+            await session.commit()
+        await call.answer()
+        await call.message.answer(
+            f"🔗 Твой код: <code>{code}</code>\n\n"
+            f"Перешли его партнёру одним сообщением. Они нажмут "
+            f"<b>«👫 Пара» → «➕ Ввести код партнёра»</b> и введут этот код.",
+            parse_mode="HTML",
+        )
+
+    @router.callback_query(F.data == "pair:enter")
+    async def cb_pair_enter(call: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(JoinPairFSM.waiting_code)
+        await call.answer()
+        await call.message.answer(
+            "✏️ Пришли код, который дал партнёр (или /cancel чтобы отменить):",
+        )
+
+    @router.message(JoinPairFSM.waiting_code, Command("cancel"))
+    async def cb_pair_cancel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer("Отменил.")
+
+    @router.message(JoinPairFSM.waiting_code)
+    async def cb_pair_code_received(message: Message, state: FSMContext) -> None:
+        code = (message.text or "").strip()
+        if not code or len(code) > 32:
+            await message.answer("Странный код. Попробуй ещё раз или /cancel")
+            return
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            pair = await repo.join_pair_by_code(session, user, code)
+            if pair is None:
+                await message.answer("❌ Код не найден. Проверь правильность или /cancel")
+                return
+            created = await repo.sync_pair_series(session, pair.id)
+            await session.commit()
+        await state.clear()
+        extra = f"\n🔄 Синхронизировал списки — у вас обоих появилось <b>{created}</b> новых сериала(ов)." if created else ""
+        await message.answer(
+            "✅ Готово, вы в одной паре!\n"
+            "Теперь /match покажет ваши общие лайки 💛"
+            + extra,
+            parse_mode="HTML",
+        )
 
     # ---------- Кнопки главного меню (текстовые) → дёргают команды ----------
 

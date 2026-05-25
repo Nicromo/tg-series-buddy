@@ -97,6 +97,57 @@ async def get_pair_members(session: AsyncSession, pair_id: int) -> Sequence[User
     return result.scalars().all()
 
 
+async def sync_pair_series(session: AsyncSession, pair_id: int) -> int:
+    """Зеркалит «хочу/смотрю/пересмотреть» между всеми членами пары.
+
+    Идемпотентно: только ДОБАВЛЯЕТ недостающие UserSeries у партнёра,
+    ничего не удаляет и не перетирает. Возвращает количество созданных
+    новых записей. Перенос только активных статусов (watched/dropped —
+    личные, не переносятся: один посмотрел, другой не обязан хотеть).
+    """
+    SHARED_STATUSES = ("want", "watching", "want_rewatch")
+    members = await get_pair_members(session, pair_id)
+    member_ids = [m.id for m in members]
+    if len(member_ids) < 2:
+        return 0
+
+    # Все UserSeries по членам пары — за один запрос
+    result = await session.execute(
+        select(UserSeries).where(
+            UserSeries.user_id.in_(member_ids),
+            UserSeries.status.in_(SHARED_STATUSES),
+        )
+    )
+    rows = result.scalars().all()
+    # Для каждого series_id — у кого уже есть запись (любого статуса)
+    have_any = set()
+    rows_all = await session.execute(
+        select(UserSeries.user_id, UserSeries.series_id).where(
+            UserSeries.user_id.in_(member_ids)
+        )
+    )
+    for uid, sid in rows_all.all():
+        have_any.add((uid, sid))
+
+    created = 0
+    for row in rows:
+        for target_uid in member_ids:
+            if target_uid == row.user_id:
+                continue
+            if (target_uid, row.series_id) in have_any:
+                continue
+            session.add(UserSeries(
+                user_id=target_uid,
+                series_id=row.series_id,
+                status=row.status,
+            ))
+            have_any.add((target_uid, row.series_id))
+            created += 1
+    if created:
+        await session.flush()
+    return created
+
+
 async def list_all_users(session: AsyncSession) -> Sequence[User]:
     result = await session.execute(select(User))
     return result.scalars().all()
