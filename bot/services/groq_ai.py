@@ -224,9 +224,8 @@ class GroqClient:
         if genre:
             bits.append(f"Жанр: {genre}")
         type_hint = {
-            "series": "СТРОГО сериал (не фильм, не мультфильм)",
-            "movie": "СТРОГО полнометражный фильм (не сериал, не мультфильм)",
-            "animation": "СТРОГО мультфильм или анимационный сериал",
+            "series": "СТРОГО сериал (не фильм)",
+            "movie":  "СТРОГО полнометражный фильм (не сериал)",
         }.get(content_type or "")
         if type_hint:
             bits.append(f"Тип контента: {type_hint}")
