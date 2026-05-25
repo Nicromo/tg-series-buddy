@@ -84,6 +84,7 @@ from ._series_helpers import (
     add_by_kp_id as _add_by_kp_id,
     details_to_series_dict as _details_to_series_dict,
     format_caption as _format_caption,
+    is_unreleased,
     send_card as _send_card,
     send_suggestions_gallery,
 )
@@ -1139,11 +1140,18 @@ def make_router(
         # Текст: заголовок + пронумерованный список
         page_label = f" · стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
         lines = [f"{header}  ·  {total} шт.{page_label}", ""]
+        unreleased_count = sum(1 for _, s in rows if is_unreleased(s))
+        if unreleased_count:
+            lines[0] += f" · ⏳ {unreleased_count} ждём"
         for i, (us, s) in enumerate(items, 1):
             marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
             year_str = f" ({s.year})" if s.year else ""
             rating_str = f" ⭐{s.rating_kp:.1f}" if s.rating_kp else ""
-            lines.append(f"{marker} <b>{s.title_ru}</b>{year_str}{rating_str}")
+            unreleased_str = ""
+            if is_unreleased(s):
+                date = s.premiere_russia or s.premiere_world
+                unreleased_str = f" · ⏳ <i>{date or 'не вышел'}</i>"
+            lines.append(f"{marker} <b>{s.title_ru}</b>{year_str}{rating_str}{unreleased_str}")
         lines.append("")
         lines.append(f"<i>Сортировка: {_SORT_LABELS.get(sort_key, sort_key)} · 👇 жми номер чтобы открыть</i>")
 
@@ -1257,8 +1265,10 @@ def make_router(
     async def cmd_random(message: Message) -> None:
         async with session_factory() as session:
             rows = await repo.list_user_series(session, message.from_user.id, status="want")
+        # Не предлагаем то что ещё не вышло — посмотреть нельзя
+        rows = [(us, s) for us, s in rows if not is_unreleased(s)]
         if not rows:
-            await message.answer("Очередь пустая.")
+            await message.answer("Очередь пустая (или в ней только не вышедшие).")
             return
         us, series = random.choice(rows)
         await message.answer("🎲 А давай вот это:", parse_mode="HTML")
@@ -1282,9 +1292,9 @@ def make_router(
         if summary_bits:
             await message.answer("📊 " + "  ·  ".join(summary_bits))
 
-        # Случайный из активных: watching → want → rewatch
+        # Случайный из активных: watching → want → rewatch. Не предлагаем ещё не вышедшие.
         for status, label in [("watching", "Ты ведь это смотришь"), ("want", "Из очереди"), ("want_rewatch", "Из пересмотра")]:
-            rows = [(us, s) for us, s in all_rows if us.status == status]
+            rows = [(us, s) for us, s in all_rows if us.status == status and not is_unreleased(s)]
             if rows:
                 us, series = random.choice(rows)
                 await message.answer(f"🍿 <b>{label}:</b>", parse_mode="HTML")
@@ -1378,9 +1388,12 @@ def make_router(
                     "📊 В паре никого кроме тебя. Подожди пока партнёр присоединится через /pair.",
                 )
                 return
-            # Кандидаты: общий want + watching
+            # Кандидаты: общий want + watching, исключая ещё не вышедшие
             rows = await repo.list_user_series(session, user.id, status=None)
-            candidates = [s for us, s in rows if us.status in ("want", "watching")]
+            candidates = [
+                s for us, s in rows
+                if us.status in ("want", "watching") and not is_unreleased(s)
+            ]
 
         if len(candidates) < 3:
             await message.answer(

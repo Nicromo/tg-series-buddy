@@ -41,6 +41,51 @@ RATING_LABELS = {"like": "👍 Лайк", "dislike": "👎 Дизлайк"}
 
 DIGIT_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
+# Статусы KP которые означают «сериал/фильм ещё не вышел»
+_UNRELEASED_STATUSES = (
+    "post-production", "pre-production", "announced",
+    "filming", "in-production",
+)
+
+
+def _date_in_future(dmy: Optional[str]) -> bool:
+    """«17.03.2026» → True если после сегодня."""
+    if not dmy:
+        return False
+    try:
+        import datetime as _dt
+        d, m, y = dmy.split(".")
+        return _dt.date(int(y), int(m), int(d)) > _dt.date.today()
+    except Exception:
+        return False
+
+
+def is_unreleased(series) -> bool:
+    """True если сериал/фильм ещё не вышел: KP status announced/production
+    ИЛИ premiere в будущем ИЛИ год явно > текущего."""
+    status_kp = (getattr(series, "status_kp", "") or "").lower()
+    if status_kp in _UNRELEASED_STATUSES:
+        return True
+    if _date_in_future(getattr(series, "premiere_world", None)):
+        return True
+    if _date_in_future(getattr(series, "premiere_russia", None)):
+        return True
+    import datetime as _dt
+    y = getattr(series, "year", None)
+    if y and y > _dt.date.today().year:
+        return True
+    return False
+
+
+def unreleased_marker(series) -> str:
+    """⏳ если не вышел и есть конкретная дата — добавляем её. Иначе пусто."""
+    if not is_unreleased(series):
+        return ""
+    date = getattr(series, "premiere_russia", None) or getattr(series, "premiere_world", None)
+    if date and _date_in_future(date):
+        return f"⏳ {date}"
+    return "⏳ ещё не вышел"
+
 
 class NoteFSM(StatesGroup):
     waiting = State()
@@ -100,6 +145,14 @@ def format_caption(
         if prem_w and prem_w != prem_r:
             bits.append(f"🌍 {prem_w}")
         lines.append("📅 Премьера: " + " · ".join(bits))
+
+    # Метка «ещё не вышел» — отдельной строкой над описанием
+    if is_unreleased(s):
+        date = prem_r or prem_w
+        if date and _date_in_future(date):
+            lines.append(f"⏳ <b>Ещё не вышел</b> · ждём {date}")
+        else:
+            lines.append("⏳ <b>Ещё не вышел</b>")
 
     if s.genres:
         lines.append(f"🎭 {s.genres}")
