@@ -2260,10 +2260,20 @@ def make_router(
         if type_slug not in _TYPE_LABEL:
             await call.answer("Неизвестный тип")
             return
+        # Получаем blacklist чтобы не показывать заблокированные жанры
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            blocked = set(await repo.list_blacklisted_genres(session, user))
+
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
         rows: list[list] = []
         cur: list = []
         for slug, label in _SUGGEST_GENRES:
+            if slug != "any" and slug in blocked:
+                continue  # этот жанр в чёрном списке — не показываем
             cur.append(IKB(text=label, callback_data=f"sg:g:{type_slug}:{slug}"))
             if len(cur) >= 2:
                 rows.append(cur)
@@ -2271,9 +2281,12 @@ def make_router(
         if cur:
             rows.append(cur)
         await call.answer()
+        header = f"Выбран: <b>{_TYPE_LABEL[type_slug]}</b>\n\n2️⃣ <b>Жанр?</b>"
+        if blocked:
+            blocked_labels = ", ".join(_GENRE_LABEL.get(b, b) for b in sorted(blocked))
+            header += f"\n\n<i>🚫 Скрыты из чёрного списка: {blocked_labels}</i>"
         await call.message.answer(
-            f"Выбран: <b>{_TYPE_LABEL[type_slug]}</b>\n\n"
-            "2️⃣ <b>Жанр?</b>",
+            header,
             parse_mode="HTML",
             reply_markup=IKM(inline_keyboard=rows),
         )
