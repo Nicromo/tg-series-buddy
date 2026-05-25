@@ -210,10 +210,19 @@ async def add_by_kp_id(
         note = us.notes if us else None
 
     if was_existing:
+        # Контекстная подсказка: какую кнопку жать в зависимости от текущего статуса
+        hints = {
+            "want": "Жми ▶️ если уже начал смотреть.",
+            "watching": "Жми ✅ если досмотрел.",
+            "watched": "Жми 🔁 если хочешь пересмотреть.",
+            "want_rewatch": "Жми ▶️ когда возьмёшься за пересмотр.",
+            "dropped": "Жми 👀 чтобы вернуть в очередь.",
+        }
+        hint = hints.get(status, "Меняй статус кнопками ниже 👇")
         await bot.send_message(
             chat_id,
-            f"💡 <b>{series.title_ru}</b> уже у тебя — статус: {STATUS_LABELS.get(status, status)}.\n"
-            f"Можешь поменять кнопками ниже 👇",
+            f"💡 <b>{series.title_ru}</b> уже у тебя — статус: "
+            f"{STATUS_LABELS.get(status, status)}.\n{hint}",
             parse_mode="HTML",
         )
     else:

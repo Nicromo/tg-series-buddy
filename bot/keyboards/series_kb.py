@@ -65,7 +65,10 @@ def checkin_keyboard(series_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✅ Досмотрел", callback_data=f"ck:fin:{series_id}"),
                 InlineKeyboardButton(text="▶️ Ещё смотрю", callback_data=f"ck:cont:{series_id}"),
             ],
-            [InlineKeyboardButton(text="❌ Дропнул", callback_data=f"ck:drop:{series_id}")],
+            [
+                InlineKeyboardButton(text="📝 Где остановились", callback_data=f"note:{series_id}"),
+                InlineKeyboardButton(text="❌ Дропнул", callback_data=f"ck:drop:{series_id}"),
+            ],
         ]
     )
 

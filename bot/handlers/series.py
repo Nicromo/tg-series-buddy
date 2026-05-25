@@ -628,16 +628,32 @@ def make_router(
 
     @router.message(Command("today"))
     async def cmd_today(message: Message) -> None:
-        """Что включить сегодня. Логика: сначала watching, потом want, потом rewatch."""
+        """Сводка по своим спискам + случайный сериал из watching/want/rewatch."""
         async with session_factory() as session:
-            for status, label in [("watching", "Ты ведь это смотришь"), ("want", "Из очереди"), ("want_rewatch", "Из пересмотра")]:
-                rows = await repo.list_user_series(session, message.from_user.id, status=status)
-                if rows:
-                    us, series = random.choice(rows)
-                    await message.answer(f"🍿 <b>{label}:</b>", parse_mode="HTML")
-                    await _send_card(message.bot, message.chat.id, series, user_status=us.status, user_rating=us.rating, note=us.notes)
-                    return
-        await message.answer("📭 Список пуст. Добавь хоть один сериал через /add 🎬")
+            all_rows = await repo.list_user_series(session, message.from_user.id, status=None)
+        if not all_rows:
+            await message.answer("📭 Список пуст. Добавь хоть один сериал через /add 🎬")
+            return
+
+        # Сводка одной строкой
+        st_count = Counter(us.status for us, _ in all_rows)
+        summary_bits = []
+        for status, emoji in [("watching", "▶️"), ("want", "👀"), ("want_rewatch", "🔁"), ("watched", "✅")]:
+            if st_count.get(status):
+                summary_bits.append(f"{emoji} {st_count[status]}")
+        if summary_bits:
+            await message.answer("📊 " + "  ·  ".join(summary_bits))
+
+        # Случайный из активных: watching → want → rewatch
+        for status, label in [("watching", "Ты ведь это смотришь"), ("want", "Из очереди"), ("want_rewatch", "Из пересмотра")]:
+            rows = [(us, s) for us, s in all_rows if us.status == status]
+            if rows:
+                us, series = random.choice(rows)
+                await message.answer(f"🍿 <b>{label}:</b>", parse_mode="HTML")
+                await _send_card(message.bot, message.chat.id, series, user_status=us.status, user_rating=us.rating, note=us.notes)
+                return
+        # Бывает что есть только watched/dropped — тогда ничего не показываем дополнительно
+        await message.answer("Активных нет. Может что-то пересмотреть? 🔁")
 
     @router.message(F.text == "🎲 Что включить?")
     async def btn_today(message: Message) -> None:
