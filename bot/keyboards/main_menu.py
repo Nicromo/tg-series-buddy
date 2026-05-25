@@ -16,6 +16,7 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="👀 Хочу"), KeyboardButton(text="▶️ Смотрю")],
             [KeyboardButton(text="✅ Посмотрел"), KeyboardButton(text="🔁 Пересмотреть")],
             [KeyboardButton(text="💛 Лайки оба"), KeyboardButton(text="✨ Подобрать")],
-            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="ℹ️ Помощь")],
+            [KeyboardButton(text="👫 Пара"), KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="ℹ️ Помощь")],
         ],
     )

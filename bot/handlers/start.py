@@ -159,4 +159,9 @@ def make_router(session_factory: async_sessionmaker) -> Router:
     async def btn_help(message: Message) -> None:
         await cmd_help(message)
 
+    @router.message(F.text == "👫 Пара")
+    async def btn_pair(message: Message) -> None:
+        # Эмулируем /pair без аргументов — выдаст invite-код или статус
+        await cmd_pair(message)
+
     return router

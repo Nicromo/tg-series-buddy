@@ -871,11 +871,22 @@ def make_router(
                 username=message.from_user.username, full_name=message.from_user.full_name,
             )
             if not user.pair_id:
-                await message.answer("👫 Сначала свяжись с партнёром через /pair")
+                await message.answer(
+                    "👫 <b>Сначала свяжись с партнёром</b>\n\n"
+                    "Жми кнопку <b>👫 Пара</b> снизу (или команду /pair) — "
+                    "получишь инвайт-код. Перешли его жене/мужу — они напишут "
+                    "<code>/pair &lt;твой код&gt;</code>, и появятся общие лайки 💛",
+                    parse_mode="HTML",
+                )
                 return
             matches = await repo.list_pair_matches(session, user.pair_id)
         if not matches:
-            await message.answer("💛 Пока нет общих лайков. Лайкайте сериалы — будет!")
+            await message.answer(
+                "💛 <b>Пока нет общих лайков</b>\n\n"
+                "Лайкайте сериалы 👍 кнопкой под карточкой — когда вы "
+                "<i>оба</i> лайкнете один и тот же, он появится здесь.",
+                parse_mode="HTML",
+            )
             return
 
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
