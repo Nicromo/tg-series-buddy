@@ -414,28 +414,36 @@ class KinopoiskClient:
         premiere_world = _fmt_date(prem.get("world"))
         premiere_russia = _fmt_date(prem.get("russia"))
 
-        # Связанные фильмы — sequels/prequels (актуально для фильмов-франшиз)
+        # Связанные фильмы — sequels/prequels (актуально для фильмов-франшиз).
+        # Защита: элемент может быть None, строкой, или dict с битыми полями.
         related_raw = d.get("sequelsAndPrequels") or []
         related: list[KPRelated] = []
-        seen_ids = set()
+        seen_ids: set[int] = set()
         for r in related_raw:
+            if not isinstance(r, dict):
+                continue
             try:
-                rid = int(r.get("id"))
+                rid = int(r.get("id") or 0)
             except Exception:
                 continue
-            if rid == int(d.get("id", 0)) or rid in seen_ids:
-                continue  # сам себя или дубль
+            if rid <= 0 or rid == int(d.get("id") or 0) or rid in seen_ids:
+                continue
             seen_ids.add(rid)
-            rating = (r.get("rating") or {}).get("kp")
-            poster = (r.get("poster") or {}).get("url") or (r.get("poster") or {}).get("previewUrl")
+            r_rating_obj = r.get("rating") if isinstance(r.get("rating"), dict) else {}
+            r_poster_obj = r.get("poster") if isinstance(r.get("poster"), dict) else {}
+            r_rating = r_rating_obj.get("kp")
+            r_poster = r_poster_obj.get("url") or r_poster_obj.get("previewUrl")
+            try:
+                rating_val = float(r_rating) if r_rating else None
+            except Exception:
+                rating_val = None
             related.append(KPRelated(
                 kp_id=rid,
                 title_ru=r.get("name") or r.get("alternativeName") or "?",
-                year=r.get("year"),
-                rating_kp=float(rating) if rating else None,
-                poster_url=poster,
+                year=r.get("year") if isinstance(r.get("year"), int) else None,
+                rating_kp=rating_val,
+                poster_url=r_poster,
             ))
-        # Сортируем по году чтобы шли в хронологическом порядке
         related.sort(key=lambda x: x.year or 0)
 
         watch_options_raw = ((d.get("watchability") or {}).get("items") or [])
