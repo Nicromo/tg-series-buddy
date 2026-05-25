@@ -557,6 +557,13 @@ def make_router(
             await call.answer("❌ Дропнул")
 
     # ============== Трейлер ==============
+    def _extract_yt_id_from_url(url: str) -> Optional[str]:
+        """Если URL — YouTube, вытащить 11-символьный id. Иначе None."""
+        if not url:
+            return None
+        m = re.search(r"(?:v=|youtu\.be/|embed/)([A-Za-z0-9_-]{11})", url)
+        return m.group(1) if m else None
+
     # Встроенный плеер Telegram (через скачивание mp4) выключен по умолчанию:
     # публичные Piped/Invidious инстансы блокируют /streams для серверных IP.
     # Включи через env INLINE_VIDEO_ENABLED=true когда поднимешь свой инстанс
@@ -638,15 +645,17 @@ def make_router(
                     series.trailer_file_id = None
                     await session.commit()
             yt_id = series.trailer_youtube_id
+            url_cached = series.trailer_url
             title = series.title_ru
             title_en = series.title_en
             year = series.year
             trailer_lang = series.trailer_language
             kp_id = series.kp_id
 
-        # 1) Кешированный yt_id
+        only_en = bool(trailer_lang and trailer_lang != "ru")
+
+        # 1a) Кешированный yt_id — YouTube
         if yt_id:
-            only_en = bool(trailer_lang and trailer_lang != "ru")
             if _inline_video_enabled and await _try_send_inline_video(
                 call.message.chat.id, call.bot,
                 title=title, youtube_id=yt_id, only_english=only_en,
@@ -659,6 +668,13 @@ def make_router(
             )
             return
 
+        # 1b) Кешированный URL — не-YouTube (RuTube etc)
+        if url_cached:
+            await _send_trailer_message(
+                call.message.chat.id, call.bot, title, url_cached, only_english=False,
+            )
+            return
+
         # 2) Ничего нет в БД — поищем через все источники
         await call.bot.send_chat_action(call.message.chat.id, action="typing")
         imdb_id = tmdb_id = None
@@ -668,16 +684,18 @@ def make_router(
             imdb_id = details.imdb_id
             tmdb_id = details.tmdb_id
             is_series_flag = details.is_series
-            # KP мог обновить trailers с момента upsert'а — сразу проверим
             if details.best_trailer_youtube_id:
                 yt_id = details.best_trailer_youtube_id
                 trailer_lang = details.best_trailer_language
         except Exception as e:
             logger.warning("kp.get_details for trailer search failed: %s", e)
 
-        if not yt_id:
+        found_url: Optional[str] = None
+        if yt_id:
+            found_url = f"https://www.youtube.com/watch?v={yt_id}"
+        else:
             try:
-                yt_id = await trailer_finder.find(
+                found_url = await trailer_finder.find(
                     title=title, year=year, title_en=title_en,
                     imdb_id=imdb_id, tmdb_id=tmdb_id,
                     is_series=is_series_flag,
@@ -685,25 +703,28 @@ def make_router(
             except Exception as e:
                 logger.exception("trailer_finder failed: %s", e)
 
-        if yt_id:
-            # Кешируем yt_id для повторных кликов
+        if found_url:
+            extracted_yt = _extract_yt_id_from_url(found_url)
             async with session_factory() as session:
                 s = await session.get(Series, series_id)
                 if s:
-                    s.trailer_youtube_id = yt_id
-                    if trailer_lang:
-                        s.trailer_language = trailer_lang
+                    if extracted_yt:
+                        s.trailer_youtube_id = extracted_yt
+                        if trailer_lang:
+                            s.trailer_language = trailer_lang
+                    else:
+                        s.trailer_url = found_url
+                        s.trailer_language = "ru"  # RuTube почти всегда русский
                     await session.commit()
-            only_en = bool(trailer_lang and trailer_lang != "ru")
-            if _inline_video_enabled and await _try_send_inline_video(
+            only_en_now = only_en if extracted_yt else False
+            if extracted_yt and _inline_video_enabled and await _try_send_inline_video(
                 call.message.chat.id, call.bot,
-                title=title, youtube_id=yt_id, only_english=only_en,
+                title=title, youtube_id=extracted_yt, only_english=only_en_now,
                 series_id_for_cache=series_id,
             ):
                 return
-            url = f"https://www.youtube.com/watch?v={yt_id}"
             await _send_trailer_message(
-                call.message.chat.id, call.bot, title, url, only_english=only_en,
+                call.message.chat.id, call.bot, title, found_url, only_english=only_en_now,
             )
             return
 
@@ -778,10 +799,12 @@ def make_router(
         trailer_lang = details.best_trailer_language
         yt_id = details.best_trailer_youtube_id
 
-        # Если KP не дал — пробуем все источники
-        if not yt_id:
+        found_url: Optional[str] = None
+        if yt_id:
+            found_url = f"https://www.youtube.com/watch?v={yt_id}"
+        else:
             try:
-                yt_id = await trailer_finder.find(
+                found_url = await trailer_finder.find(
                     title=title, year=year, title_en=details.title_en,
                     imdb_id=details.imdb_id, tmdb_id=details.tmdb_id,
                     is_series=details.is_series,
@@ -789,16 +812,16 @@ def make_router(
             except Exception as e:
                 logger.warning("trailer_finder failed in trkp: %s", e)
 
-        if yt_id:
-            only_en = bool(trailer_lang and trailer_lang != "ru")
-            if _inline_video_enabled and await _try_send_inline_video(
+        if found_url:
+            extracted_yt = _extract_yt_id_from_url(found_url)
+            only_en = bool(trailer_lang and trailer_lang != "ru") if extracted_yt else False
+            if extracted_yt and _inline_video_enabled and await _try_send_inline_video(
                 call.message.chat.id, call.bot,
-                title=title, youtube_id=yt_id, only_english=only_en,
+                title=title, youtube_id=extracted_yt, only_english=only_en,
             ):
                 return
-            url = f"https://www.youtube.com/watch?v={yt_id}"
             await _send_trailer_message(
-                call.message.chat.id, call.bot, title, url, only_english=only_en,
+                call.message.chat.id, call.bot, title, found_url, only_english=only_en,
             )
             return
 

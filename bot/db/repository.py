@@ -40,6 +40,7 @@ async def init_db(engine) -> None:
             "ALTER TABLE user_series ADD COLUMN IF NOT EXISTS notify_releases BOOLEAN DEFAULT FALSE",
             "ALTER TABLE series ADD COLUMN IF NOT EXISTS premiere_world VARCHAR(16)",
             "ALTER TABLE series ADD COLUMN IF NOT EXISTS premiere_russia VARCHAR(16)",
+            "ALTER TABLE series ADD COLUMN IF NOT EXISTS trailer_url VARCHAR(512)",
         ]:
             try:
                 await conn.exec_driver_sql(sql)

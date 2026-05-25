@@ -69,6 +69,8 @@ class Series(Base):
     trailer_youtube_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     trailer_file_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     trailer_language: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    # Для не-YouTube источников (RuTube etc) храним полный URL отдельно
+    trailer_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     # JSON список [{name, url}] — где смотреть
     watch_options_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

@@ -1,4 +1,4 @@
-"""Многоисточниковый поиск YouTube-id трейлера.
+"""Многоисточниковый поиск URL трейлера.
 
 Стратегия (по убыванию приоритета и качества):
 
@@ -11,24 +11,26 @@
    "<название> русский трейлер <год>" → первый videoId. 10К запросов
    в день бесплатно (1 search = 100 units).
 
-3. **Piped** — без ключа. Публичные инстансы (kavin.rocks, adminforge
-   и др.) проксируют YouTube API. Падают периодически — пытаемся
-   несколько по очереди.
+3. **Piped** — без ключа. Публичные инстансы проксируют YouTube API.
+   Падают периодически — пытаемся несколько по очереди.
 
-4. **Invidious** — без ключа, другой набор публичных инстансов
-   (privacyredirect, yewtu.be и др.). Дополняет Piped: если один
-   набор лежит — обычно другой работает.
+4. **Invidious** — без ключа, другой набор публичных инстансов.
+   Дополняет Piped.
 
-5. **DuckDuckGo HTML search** — без ключа. Парсим HTML страницы
+5. **RuTube** — без ключа. Публичное API rutube.ru/api/search/video/.
+   Отдаёт RuTube URL (не YouTube). Часто именно русские трейлеры
+   как для русского, так и для зарубежного контента. Telegram сам
+   отрендерит preview по URL.
+
+6. **DuckDuckGo HTML search** — без ключа. Парсим HTML страницы
    результатов с фильтром site:youtube.com, достаём первый
-   youtube.com/watch?v=... URL. DDG не банит за частые запросы
-   как Google.
+   youtube.com/watch?v=... URL.
 
-6. **YouTube search URL fallback** — если ничего не нашли, возвращаем
+7. **YouTube search URL fallback** — если ничего не нашли, возвращаем
    ссылку на страницу поиска YouTube. Telegram отрендерит preview,
    юзер выберет нужный сам. Никогда не пусто.
 
-Результат: либо youtube_id (11 символов), либо None (если совсем ничего).
+Результат: URL (любой источник) или None.
 build_youtube_search_url(title) даёт fallback URL отдельно.
 """
 
@@ -306,6 +308,50 @@ class TrailerFinder:
                     continue
         return None
 
+    # ---------- Источник 4.5: RuTube (без ключа, отдаёт RU трейлеры) ----------
+
+    async def from_rutube(self, *, title: str, year: Optional[int]) -> Optional[str]:
+        """Поиск трейлера на RuTube. Возвращает RuTube URL (НЕ YouTube).
+        Часто отдаёт именно русские трейлеры для русских и зарубежных названий.
+        Telegram сам отрисует preview с тумбнейлом.
+        """
+        q = f"{title} русский трейлер"
+        if year:
+            q += f" {year}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout,
+                follow_redirects=True,
+                headers={"User-Agent": UA_BROWSER, "Accept": "application/json"},
+            ) as c:
+                r = await c.get(
+                    "https://rutube.ru/api/search/video/",
+                    params={"query": q, "format": "json"},
+                )
+                if r.status_code != 200:
+                    logger.warning("RuTube status %s", r.status_code)
+                    return None
+                results = (r.json().get("results") or [])[:5]
+                # Берём результат у которого в title есть «трейлер» (отсекаем подкасты/обзоры/реакции)
+                trailer_words = ("трейлер", "тизер", "trailer", "teaser")
+                bad_words = ("обзор", "разбор", "реакция", "review", "podcast", "подкаст")
+                best = None
+                for it in results:
+                    t = (it.get("title") or "").lower()
+                    url = it.get("video_url") or ""
+                    if not url:
+                        continue
+                    has_trailer = any(w in t for w in trailer_words)
+                    has_bad = any(w in t for w in bad_words)
+                    if has_trailer and not has_bad:
+                        return url  # первый хороший — берём
+                    if best is None and not has_bad:
+                        best = url
+                return best
+        except Exception as e:
+            logger.warning("RuTube failed: %s", e)
+        return None
+
     # ---------- Источник 5: DuckDuckGo HTML (без ключа) ----------
 
     async def _ddg_one(self, q: str) -> Optional[str]:
@@ -487,15 +533,18 @@ class TrailerFinder:
         is_series: bool = True,
         kp_trailer_youtube_id: Optional[str] = None,
     ) -> Optional[str]:
-        """Возвращает YouTube id или None.
+        """Возвращает URL трейлера (любой источник) или None.
 
-        Порядок: уже знаем из KP → TMDB → YouTube Data API → Piped →
-        Invidious → DuckDuckGo (для каждого keyless источника пробуем
-        ещё и title_en если он есть — KP плохо ищет по русским
-        транслитерациям вроде «Молодой Шерлок»).
+        Порядок: KP → TMDB → YouTube API → Piped → Invidious → RuTube →
+        DuckDuckGo. Для YouTube-источников URL вида
+        https://www.youtube.com/watch?v=<id>; для RuTube — rutube.ru/video/.../.
+        Каждый keyless источник пробуем с title_ru и title_en.
         """
         if kp_trailer_youtube_id:
-            return kp_trailer_youtube_id
+            return f"https://www.youtube.com/watch?v={kp_trailer_youtube_id}"
+
+        def _yt_url(yt_id: str) -> str:
+            return f"https://www.youtube.com/watch?v={yt_id}"
 
         # 1. TMDB
         if self._tmdb_key:
@@ -506,7 +555,7 @@ class TrailerFinder:
                 )
                 if yt_id:
                     logger.info("Trailer for %s via TMDB: %s", title, yt_id)
-                    return yt_id
+                    return _yt_url(yt_id)
             except Exception as e:
                 logger.warning("TMDB stage failed: %s", e)
 
@@ -517,36 +566,46 @@ class TrailerFinder:
                     yt_id = await self.from_youtube_api(title=q_title, year=year)
                     if yt_id:
                         logger.info("Trailer for %s via YouTube API (%s): %s", title, q_title, yt_id)
-                        return yt_id
+                        return _yt_url(yt_id)
                 except Exception as e:
                     logger.warning("YouTube API stage failed for %s: %s", q_title, e)
 
-        # 3. Piped — пробуем ru + en title
+        # 3. Piped
         for q_title in (t for t in (title, title_en) if t):
             try:
                 yt_id = await self.from_piped(title=q_title, year=year)
                 if yt_id:
                     logger.info("Trailer for %s via Piped (%s): %s", title, q_title, yt_id)
-                    return yt_id
+                    return _yt_url(yt_id)
             except Exception as e:
                 logger.warning("Piped stage failed for %s: %s", q_title, e)
 
-        # 4. Invidious — пробуем ru + en title
+        # 4. Invidious
         for q_title in (t for t in (title, title_en) if t):
             try:
                 yt_id = await self.from_invidious(title=q_title, year=year)
                 if yt_id:
                     logger.info("Trailer for %s via Invidious (%s): %s", title, q_title, yt_id)
-                    return yt_id
+                    return _yt_url(yt_id)
             except Exception as e:
                 logger.warning("Invidious stage failed for %s: %s", q_title, e)
 
-        # 5. DuckDuckGo HTML — внутри сам пробует ru/en варианты
+        # 5. RuTube — отдаёт точные русские трейлеры для русских и
+        # зарубежных названий. Telegram сам отрисует preview.
+        try:
+            rutube_url = await self.from_rutube(title=title, year=year)
+            if rutube_url:
+                logger.info("Trailer for %s via RuTube: %s", title, rutube_url)
+                return rutube_url
+        except Exception as e:
+            logger.warning("RuTube stage failed: %s", e)
+
+        # 6. DuckDuckGo HTML
         try:
             yt_id = await self.from_duckduckgo(title=title, year=year, title_en=title_en)
             if yt_id:
                 logger.info("Trailer for %s via DuckDuckGo: %s", title, yt_id)
-                return yt_id
+                return _yt_url(yt_id)
         except Exception as e:
             logger.warning("DuckDuckGo stage failed: %s", e)
 
