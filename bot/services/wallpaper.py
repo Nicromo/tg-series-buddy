@@ -86,6 +86,19 @@ def _strip_emoji(status_label: str) -> tuple[str, str]:
     return label, color
 
 
+def _decline_titles(n: int) -> str:
+    """1 тайтл, 2-4 тайтла, 5-20 тайтлов."""
+    n_abs = abs(n) % 100
+    if 10 <= n_abs <= 20:
+        return "тайтлов"
+    last = n_abs % 10
+    if last == 1:
+        return "тайтл"
+    if 2 <= last <= 4:
+        return "тайтла"
+    return "тайтлов"
+
+
 async def build_week_wallpaper(
     items: list,
     *,
@@ -125,15 +138,16 @@ async def build_week_wallpaper(
         img.save(buf, "PNG", optimize=True)
         return buf.getvalue()
 
-    sub = f"{len(items)} тайтлов — общий список с партнёром"
-    draw.text((W // 2, 235), sub, font=_font(28), anchor="mm", fill="#c8c0e0")
-
     # Скачиваем постеры параллельно
     import asyncio
     poster_bytes = await asyncio.gather(*(
         _fetch_poster_bytes(s.poster_url) if s.poster_url else _no_poster()
         for _, s in items[:5]
     ))
+    # Реальное число с постерами (могли не скачаться 1-2)
+    real_count = sum(1 for pb in poster_bytes if pb)
+    sub = f"{real_count} {_decline_titles(real_count)} — общий список с партнёром"
+    draw.text((W // 2, 235), sub, font=_font(28), anchor="mm", fill="#c8c0e0")
 
     # Главный постер
     main_pb = poster_bytes[0] if poster_bytes else None

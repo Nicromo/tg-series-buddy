@@ -1441,12 +1441,13 @@ def make_router(
                 username=message.from_user.username, full_name=message.from_user.full_name,
             )
             rows = await repo.list_user_series(session, user.id, status=None)
-        # Топ-5 активных: priority watching > want > rewatch > watched, по обновлению
+        # Топ-15 активных: priority watching > want > rewatch > watched. Берём
+        # с запасом — на постере покажем только те у кого есть poster_url.
         priority = {"watching": 0, "want": 1, "want_rewatch": 2, "watched": 3}
         active = sorted(
-            ((us, s) for us, s in rows if us.status in priority),
+            ((us, s) for us, s in rows if us.status in priority and s.poster_url),
             key=lambda x: (priority.get(x[0].status, 9), -(x[0].updated_at.timestamp() if x[0].updated_at else 0)),
-        )[:5]
+        )[:5]  # 5 с постерами
         status_labels = {"watching": "▶️ Смотрим", "want": "👀 Хотим", "want_rewatch": "🔁 Пересмотр", "watched": "✅ Досмотрено"}
         items = [(status_labels.get(us.status, "🎬"), s) for us, s in active]
 
