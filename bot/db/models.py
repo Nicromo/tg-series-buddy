@@ -85,6 +85,20 @@ class Series(Base):
     added_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class BlacklistedGenre(Base):
+    """Жанры которые НИКОГДА не предлагать в /suggest. Общая для пары если
+    есть pair_id, иначе личная."""
+
+    __tablename__ = "blacklisted_genres"
+    __table_args__ = (UniqueConstraint("pair_id", "user_id", "genre", name="uq_bl_genre"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    pair_id: Mapped[Optional[int]] = mapped_column(ForeignKey("pairs.id"), nullable=True, index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    genre: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class YoutubeSubscription(Base):
     """Подписка на YouTube-канал. Общая для пары (если есть pair_id),
     иначе личная (привязка к user_id).

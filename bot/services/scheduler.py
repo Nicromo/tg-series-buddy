@@ -19,7 +19,7 @@ from ..db import repository as repo
 from ..keyboards.series_kb import checkin_keyboard
 from .kinopoisk import KinopoiskClient
 from .season_watcher import check_new_seasons, check_today_episodes
-from .youtube_rss import fetch_latest_videos
+from .youtube_rss import fetch_latest_videos, is_youtube_short
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +71,20 @@ async def check_youtube_subscriptions(bot: Bot, session_factory: async_sessionma
         by_channel.setdefault(s.channel_id, []).append(s)
 
     for channel_id, subs_list in by_channel.items():
-        videos = await fetch_latest_videos(channel_id, limit=1)
+        # Берём не последнее 1, а 5 — чтобы пропустить Shorts и найти полноценное.
+        videos = await fetch_latest_videos(channel_id, limit=5)
         if not videos:
             continue
-        latest = videos[0]
+        # Пропускаем Shorts — пушим только полноценные видео.
+        latest = None
+        for v in videos:
+            if await is_youtube_short(v.video_id):
+                logger.info("Skip Shorts %s for %s", v.video_id, channel_id)
+                continue
+            latest = v
+            break
+        if latest is None:
+            continue
         for sub in subs_list:
             if sub.last_video_id == latest.video_id:
                 continue

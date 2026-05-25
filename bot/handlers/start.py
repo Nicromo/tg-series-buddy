@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -10,18 +11,26 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ..db import repository as repo
 from ..db.models import Pair, Series, YoutubeSubscription
 from ..keyboards.main_menu import main_menu
-from ..services.youtube_rss import resolve_channel, fetch_latest_videos, fetch_channel_title_robust
+from ..services.youtube_rss import (
+    resolve_channel, fetch_latest_videos, fetch_channel_title_robust, is_youtube_short,
+)
 
 
 class JoinPairFSM(StatesGroup):
     waiting_code = State()
+
+
+class DonateAmountFSM(StatesGroup):
+    waiting = State()
 
 WELCOME = (
     "🛋️ <b>Диванные критики</b>\n"
@@ -421,5 +430,120 @@ def make_router(session_factory: async_sessionmaker) -> Router:
     async def btn_pair(message: Message) -> None:
         # Эмулируем /pair без аргументов — выдаст invite-код или статус
         await cmd_pair(message)
+
+    # ---------- Поддержать проект (Telegram Stars) ----------
+
+    _STAR_OPTIONS = [1, 10, 50, 100, 500]  # быстрые суммы
+
+    @router.message(Command("donate"))
+    async def cmd_donate(message: Message) -> None:
+        bot_user = await message.bot.me()
+        share_link = f"https://t.me/{bot_user.username}"
+        # Кнопки сумм — по 5 в ряд если влезут, иначе по 2-3
+        amount_row = [
+            InlineKeyboardButton(text=f"⭐ {n}", callback_data=f"donate:{n}")
+            for n in _STAR_OPTIONS
+        ]
+        rows = [
+            amount_row,
+            [InlineKeyboardButton(text="✏️ Своя сумма", callback_data="donate:custom")],
+            [InlineKeyboardButton(text="📤 Рассказать о боте друзьям", url=f"https://t.me/share/url?url={share_link}&text=Бот для семейного учёта сериалов")],
+        ]
+        cloudtips = os.getenv("DONATE_CLOUDTIPS_URL", "").strip()
+        if cloudtips:
+            rows.append([InlineKeyboardButton(text="🔗 CloudTips (с карты)", url=cloudtips)])
+
+        await message.answer(
+            "💛 <b>Спасибо что пользуешься ботом!</b>\n\n"
+            "Бот бесплатный — у меня нет на нём заработка. Если хочется "
+            "помочь оплатить хостинг и API — вот варианты "
+            "<i>без раскрытия каких-либо реквизитов:</i>\n\n"
+            "⭐ <b>Звёздами Telegram</b> — самый простой, всё внутри Telegram, "
+            "ничего не привязывать. От <b>1 ⭐</b> и выше.\n"
+            "📤 <b>Поделись с друзьями</b> — самая ценная помощь.\n\n"
+            "Выбери сумму или введи свою:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    @router.message(F.text == "💛 Поддержать")
+    async def btn_donate(message: Message) -> None:
+        await cmd_donate(message)
+
+    async def _send_stars_invoice(bot, chat_id: int, user_id: int, amount: int) -> None:
+        """Создаёт счёт в Telegram Stars (валюта XTR)."""
+        if amount < 1:
+            amount = 1
+        if amount > 100000:
+            amount = 100000
+        try:
+            await bot.send_invoice(
+                chat_id=chat_id,
+                title=f"⭐ Поддержать бота ({amount} {'звезда' if amount == 1 else 'звёзд'})",
+                description=(
+                    "Спасибо что помогаешь! Деньги пойдут на хостинг "
+                    "(Render + Neon Postgres) и API."
+                ),
+                payload=f"donate_{amount}_{user_id}",
+                currency="XTR",  # Telegram Stars
+                prices=[LabeledPrice(label=f"{amount} ⭐", amount=amount)],
+            )
+        except Exception as e:
+            import logging
+            logging.exception("send_invoice failed")
+            await bot.send_message(chat_id, f"😕 Не получилось создать счёт: {e}")
+
+    @router.callback_query(F.data.startswith("donate:"))
+    async def cb_donate_stars(call: CallbackQuery, state: FSMContext) -> None:
+        arg = call.data.split(":")[1]
+        if arg == "custom":
+            await state.set_state(DonateAmountFSM.waiting)
+            await call.answer()
+            await call.message.answer(
+                "✏️ Введи сколько звёзд хочешь подарить (от <b>1</b> до 100000).\n"
+                "/cancel — отменить",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            amount = int(arg)
+        except Exception:
+            await call.answer("Странная сумма")
+            return
+        await call.answer()
+        await _send_stars_invoice(call.bot, call.message.chat.id, call.from_user.id, amount)
+
+    @router.message(DonateAmountFSM.waiting, Command("cancel"))
+    async def donate_cancel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer("Отменил.")
+
+    @router.message(DonateAmountFSM.waiting)
+    async def donate_amount_typed(message: Message, state: FSMContext) -> None:
+        text = (message.text or "").strip()
+        if not text.isdigit():
+            await message.answer("Нужно число от 1 до 100000. Попробуй ещё или /cancel")
+            return
+        amount = int(text)
+        if amount < 1 or amount > 100000:
+            await message.answer("Число от 1 до 100000. /cancel — отменить")
+            return
+        await state.clear()
+        await _send_stars_invoice(message.bot, message.chat.id, message.from_user.id, amount)
+
+    @router.pre_checkout_query()
+    async def on_pre_checkout(query: PreCheckoutQuery) -> None:
+        # Просто подтверждаем — для Stars никаких проверок не нужно
+        await query.answer(ok=True)
+
+    @router.message(F.successful_payment)
+    async def on_successful_payment(message: Message) -> None:
+        amount = message.successful_payment.total_amount
+        await message.answer(
+            f"🌟 <b>Спасибо за поддержку!</b>\n\n"
+            f"Получил <b>{amount}</b> ⭐ — это правда помогает держать бота онлайн. "
+            f"Хорошего тебе вечера за просмотром 🍿",
+            parse_mode="HTML",
+        )
 
     return router

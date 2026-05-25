@@ -339,11 +339,16 @@ async def send_suggestions_gallery(
     kp: KinopoiskClient,
     *,
     header: str = "✨ <b>Идеи от ИИ:</b>",
-) -> None:
+    extra_kb: Optional[list[list]] = None,
+) -> tuple[list[int], list[tuple]]:
+    """Возвращает (message_ids, items) для последующего удаления / повторного показа.
+    items = list[(SuggestedSeries, KPSearchHit)].
+    extra_kb — дополнительные ряды кнопок в конец (например «Дальше/Назад»)."""
     """Универсальный рендер «галерея постеров + список + add/trailer кнопки».
     Используется в /suggest и в «похожие на этот»."""
+    message_ids: list[int] = []
     items: list[tuple] = []
-    for sug in suggestions[:3]:
+    for sug in suggestions[:10]:
         query = f"{sug.title} {sug.year}" if sug.year else sug.title
         try:
             hits = await kp.search(query, limit=1)
@@ -354,7 +359,8 @@ async def send_suggestions_gallery(
 
     if not items:
         # Фолбэк — текст без постеров
-        await bot.send_message(chat_id, header, parse_mode="HTML")
+        m = await bot.send_message(chat_id, header, parse_mode="HTML")
+        message_ids.append(m.message_id)
         for sug in suggestions:
             txt = f"🎬 <b>{sug.title}</b>"
             if sug.year:
@@ -362,8 +368,9 @@ async def send_suggestions_gallery(
             if sug.why:
                 txt += f"\n💡 <i>{sug.why}</i>"
             txt += f"\n\nДобавить? <code>/add {sug.title}</code>"
-            await bot.send_message(chat_id, txt, parse_mode="HTML")
-        return
+            m = await bot.send_message(chat_id, txt, parse_mode="HTML")
+            message_ids.append(m.message_id)
+        return message_ids, items
 
     # Подпись к первому фото — компактный список (лимит 1024)
     list_lines: list[str] = [header, ""]
@@ -392,23 +399,28 @@ async def send_suggestions_gallery(
     sent_caption = False
     if len(media) >= 2:
         try:
-            await bot.send_media_group(chat_id, media)
+            msgs = await bot.send_media_group(chat_id, media)
+            for mm in msgs:
+                message_ids.append(mm.message_id)
             sent_caption = True
         except Exception as e:
             logger.warning("send_media_group failed for suggestions: %s", e)
     elif len(media) == 1:
         try:
-            m = media[0]
-            await bot.send_photo(chat_id, photo=m.media, caption=caption, parse_mode="HTML")
+            mm = media[0]
+            sent = await bot.send_photo(chat_id, photo=mm.media, caption=caption, parse_mode="HTML")
+            message_ids.append(sent.message_id)
             sent_caption = True
         except Exception as e:
             logger.warning("send_photo failed for suggestions: %s", e)
     if not sent_caption:
-        await bot.send_message(chat_id, caption, parse_mode="HTML")
+        sent = await bot.send_message(chat_id, caption, parse_mode="HTML")
+        message_ids.append(sent.message_id)
 
     # Кнопки одной строкой на сериал — сразу понятно куда что:
     #   [ ➕ Добавить «Severance» ]
-    #   [ ✅ Уже смотрел ]  [ 🎥 Трейлер ]
+    #   [ ✅ Уже смотрел ] [ ❌ Не интересно ]
+    #   [ 🎥 Трейлер ]
     rows: list[list[InlineKeyboardButton]] = []
     for sug, hit in items:
         title_full = hit.title_ru or sug.title or ""
@@ -421,10 +433,17 @@ async def send_suggestions_gallery(
         ])
         rows.append([
             InlineKeyboardButton(text="✅ Уже смотрел", callback_data=f"seenkp:{hit.kp_id}"),
+            InlineKeyboardButton(text="❌ Не интересно", callback_data=f"skipkp:{hit.kp_id}"),
+        ])
+        rows.append([
             InlineKeyboardButton(text="🎥 Трейлер", callback_data=f"trkp:{hit.kp_id}"),
         ])
-    await bot.send_message(
+    if extra_kb:
+        rows.extend(extra_kb)
+    sent_kb = await bot.send_message(
         chat_id,
         "Выбирай 👇",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
+    message_ids.append(sent_kb.message_id)
+    return message_ids, items

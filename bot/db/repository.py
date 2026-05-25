@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from .models import Base, Pair, Series, User, UserSeries, YoutubeSubscription, utcnow
+from .models import Base, BlacklistedGenre, Pair, Series, User, UserSeries, YoutubeSubscription, utcnow
 
 
 def make_engine(db_url: str):
@@ -313,6 +313,51 @@ async def list_release_subscribers(session: AsyncSession) -> list[tuple[int, Ser
     )
     rows = (await session.execute(stmt)).all()
     return [(uid, s) for uid, s in rows]
+
+
+# ---------- Blacklisted genres ----------
+
+async def toggle_blacklisted_genre(
+    session: AsyncSession, user: User, genre: str
+) -> bool:
+    """Toggle жанра в blacklist. Возвращает новое состояние (True=в blacklist).
+    Общий для пары если есть pair_id, иначе личный."""
+    scope_clause = (
+        BlacklistedGenre.pair_id == user.pair_id if user.pair_id
+        else (BlacklistedGenre.user_id == user.id) & BlacklistedGenre.pair_id.is_(None)
+    )
+    result = await session.execute(
+        select(BlacklistedGenre).where(
+            scope_clause, BlacklistedGenre.genre == genre,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing:
+        await session.delete(existing)
+        await session.flush()
+        return False
+    session.add(BlacklistedGenre(
+        pair_id=user.pair_id,
+        user_id=None if user.pair_id else user.id,
+        genre=genre,
+    ))
+    await session.flush()
+    return True
+
+
+async def list_blacklisted_genres(session: AsyncSession, user: User) -> list[str]:
+    if user.pair_id:
+        result = await session.execute(
+            select(BlacklistedGenre.genre).where(BlacklistedGenre.pair_id == user.pair_id)
+        )
+    else:
+        result = await session.execute(
+            select(BlacklistedGenre.genre).where(
+                BlacklistedGenre.user_id == user.id,
+                BlacklistedGenre.pair_id.is_(None),
+            )
+        )
+    return [g for (g,) in result.all()]
 
 
 # ---------- YouTube subscriptions ----------

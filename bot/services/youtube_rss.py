@@ -250,6 +250,28 @@ async def fetch_channel_title_robust(channel_id: str) -> Optional[str]:
 
 # ---------- Последние видео ----------
 
+async def is_youtube_short(video_id: str) -> bool:
+    """True если видео — Shorts (вертикальное, до 3 мин).
+    Способ: oEmbed API возвращает 404 для Shorts, 200 для обычных видео.
+    Это надёжный и быстрый детект (1 HTTP-запрос, без HTML парсинга).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=8.0, headers={"User-Agent": _UA}) as c:
+            r = await c.get(
+                "https://www.youtube.com/oembed",
+                params={
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "format": "json",
+                },
+            )
+            # 200 — обычное видео; 404 — Shorts (oEmbed для них недоступен)
+            return r.status_code == 404
+    except Exception as e:
+        logger.warning("oembed check %s failed: %s", video_id, e)
+        # При ошибке считаем что НЕ shorts — лучше показать лишнее чем потерять
+        return False
+
+
 async def fetch_latest_videos(channel_id: str, *, limit: int = 5) -> list[VideoEntry]:
     """Тянет до `limit` последних видео канала."""
     try:

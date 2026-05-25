@@ -1061,6 +1061,34 @@ def make_router(
             parse_mode="HTML",
         )
 
+    @router.callback_query(F.data.startswith("skipkp:"))
+    async def cb_skip_kp(call: CallbackQuery) -> None:
+        """«❌ Не интересно» из предложений ИИ: сохраняем со статусом
+        dropped — больше не предлагать (но в /list не попадёт)."""
+        kp_id = int(call.data.split(":")[1])
+        await call.answer("Запомнил")
+        try:
+            details = await kp.get_details(kp_id)
+        except Exception as e:
+            logger.exception("KP details failed for skipkp")
+            await call.message.answer(f"😕 Не получилось загрузить: {e}")
+            return
+        async with session_factory() as session:
+            await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            await repo.upsert_series_from_dict(session, _details_to_series_dict(details))
+            await session.commit()
+            series = await repo.get_series_by_kp_id(session, details.kp_id)
+            await repo.set_user_series_status(session, call.from_user.id, series.id, "dropped")
+            await session.commit()
+        await call.message.answer(
+            f"❌ <b>{details.title_ru}</b> — не интересно. "
+            f"Больше не предложу.",
+            parse_mode="HTML",
+        )
+
     @router.callback_query(F.data.startswith("trkp:"))
     async def cb_trailer_kp(call: CallbackQuery) -> None:
         kp_id = int(call.data.split(":")[1])
@@ -1976,59 +2004,435 @@ def make_router(
     async def btn_stats(message: Message) -> None:
         await cmd_stats(message)
 
-    # ============== /suggest — Groq AI рекомендации ==============
+    # ============== /suggest — Groq AI рекомендации с выбором ==============
+    _SUGGEST_TYPES = [
+        ("any",       "🎲 Любой"),
+        ("series",    "📺 Сериал"),
+        ("movie",     "🎬 Фильм"),
+        ("animation", "🎨 Мультфильм"),
+    ]
+    _SUGGEST_GENRES = [
+        ("any",         "🎲 Любой жанр"),
+        ("драма",       "🎭 Драма"),
+        ("триллер",     "🔪 Триллер"),
+        ("комедия",     "😄 Комедия"),
+        ("фантастика",  "🚀 Фантастика"),
+        ("ужасы",       "👻 Ужасы"),
+        ("мелодрама",   "❤️ Мелодрама"),
+        ("детектив",    "🔍 Детектив"),
+        ("боевик",      "💥 Боевик"),
+        ("фэнтези",     "🧙 Фэнтези"),
+        ("приключения", "🗺 Приключения"),
+        ("криминал",    "🕴 Криминал"),
+    ]
+    _SUGGEST_YEARS = [
+        ("any",       "🎲 Любой год"),
+        ("2024_2030", "🆕 Новинки 2024+"),
+        ("2020_2030", "📅 2020-е"),
+        ("2010_2019", "📅 2010–2019"),
+        ("2000_2009", "📅 2000-е"),
+        ("1990_1999", "📅 90-е"),
+        ("1900_1989", "📼 Ретро (до 90-х)"),
+        ("custom",    "✏️ Указать диапазон"),
+    ]
+    _TYPE_LABEL = dict(_SUGGEST_TYPES)
+    _GENRE_LABEL = dict(_SUGGEST_GENRES)
+    _YEAR_LABEL = dict(_SUGGEST_YEARS)
+
+    class SuggestYearFSM(StatesGroup):
+        waiting = State()
+
+    # In-memory история подборок per-user (НЕ persistent — переживать рестарт
+    # не требуется, это live-сессия выбора).
+    # user_id → {"batches": [{"type":..., "genre":..., "year":..., "titles":[...],
+    #            "message_ids":[...]}], "cursor": int}
+    _suggest_history: dict[int, dict] = {}
+
     @router.message(Command("suggest"))
     async def cmd_suggest(message: Message) -> None:
         if not groq:
             await message.answer("🤖 Подбор от ИИ недоступен — нет GROQ_API_KEY")
             return
-        await message.bot.send_chat_action(message.chat.id, action="typing")
-        async with session_factory() as session:
-            user = await repo.get_or_create_user(
-                session, tg_id=message.from_user.id,
-                username=message.from_user.username, full_name=message.from_user.full_name,
-            )
-            partner_ids: list[int] = []
-            if user.pair_id:
-                members = await repo.get_pair_members(session, user.pair_id)
-                partner_ids = [m.id for m in members if m.id != user.id]
-
-            my_rows = await repo.list_user_series(session, user.id, status=None)
-            partner_rows: list = []
-            if partner_ids:
-                partner_rows = await repo.list_user_series(session, partner_ids[0], status=None)
-
-        # «Нравится» = всё что в want/watching/watched (нет деления на rating).
-        # «Не зашло» = dropped.
-        all_rows = my_rows + partner_rows
-        liked = sorted({s.title_ru for us, s in all_rows if us.status in ("want", "watching", "watched", "want_rewatch")})
-        disliked = sorted({s.title_ru for us, s in all_rows if us.status == "dropped"})
-        # Исключаем ВСЕ известные сериалы — больше не предлагать повторно.
-        known_titles = sorted({s.title_ru for _, s in all_rows})
-
-        try:
-            suggestions = await groq.suggest_for_pair(
-                likes_a=liked, likes_b=[],
-                dislikes_a=disliked, dislikes_b=[],
-                already_in_queue=known_titles,
-            )
-        except Exception as e:
-            logger.exception("Groq suggest failed")
-            await message.answer(f"😕 ИИ заглох: {e}")
-            return
-
-        if not suggestions:
-            await message.answer("🤔 Не получилось придумать. Попробуй позже.")
-            return
-
-        await send_suggestions_gallery(
-            message.bot, message.chat.id, suggestions, kp,
-            header=f"✨ <b>Идеи от ИИ ({len(suggestions)}):</b>",
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        rows: list[list] = []
+        cur: list = []
+        for slug, label in _SUGGEST_TYPES:
+            cur.append(IKB(text=label, callback_data=f"sg:t:{slug}"))
+            if len(cur) >= 2:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+        rows.append([IKB(text="🎁 Чистый рандом — удиви", callback_data="sg:t:any:any")])
+        await message.answer(
+            "✨ <b>Что вам подобрать?</b>\n\n"
+            "1️⃣ <b>Тип контента:</b>",
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=rows),
         )
 
     @router.message(F.text == "✨ Подобрать")
     async def btn_suggest(message: Message) -> None:
         await cmd_suggest(message)
+
+    # ============== /blacklist — жанры которые никогда не предлагать ==============
+    async def _render_blacklist(message_or_call, edit: bool = False) -> None:
+        if isinstance(message_or_call, CallbackQuery):
+            user_id = message_or_call.from_user.id
+            chat_id = message_or_call.message.chat.id
+            bot_obj = message_or_call.bot
+            from_user = message_or_call.from_user
+        else:
+            user_id = message_or_call.from_user.id
+            chat_id = message_or_call.chat.id
+            bot_obj = message_or_call.bot
+            from_user = message_or_call.from_user
+
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=user_id, username=from_user.username, full_name=from_user.full_name,
+            )
+            blocked = set(await repo.list_blacklisted_genres(session, user))
+
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        rows: list[list] = []
+        cur: list = []
+        # Идём по всем жанрам кроме «Любой жанр»
+        for slug, label in _SUGGEST_GENRES[1:]:
+            mark = "🚫" if slug in blocked else "✅"
+            cur.append(IKB(text=f"{mark} {label}", callback_data=f"bl:{slug}"))
+            if len(cur) >= 2:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+
+        text_lines = ["🚫 <b>Жанры в чёрном списке</b>", ""]
+        if blocked:
+            text_lines.append(f"<b>Не предлагаются:</b> {', '.join(sorted(blocked))}")
+        else:
+            text_lines.append("Чёрный список пуст — ИИ может предложить любой жанр.")
+        text_lines.append("")
+        text_lines.append("<i>🚫 — заблокирован, ✅ — разрешён. Жми чтобы переключить.</i>")
+        markup = IKM(inline_keyboard=rows)
+        if edit and isinstance(message_or_call, CallbackQuery):
+            try:
+                await message_or_call.message.edit_text(
+                    "\n".join(text_lines), parse_mode="HTML", reply_markup=markup,
+                )
+                return
+            except Exception:
+                pass
+        await bot_obj.send_message(chat_id, "\n".join(text_lines), parse_mode="HTML", reply_markup=markup)
+
+    @router.message(Command("blacklist"))
+    async def cmd_blacklist(message: Message) -> None:
+        await _render_blacklist(message)
+
+    @router.callback_query(F.data.startswith("bl:"))
+    async def cb_blacklist_toggle(call: CallbackQuery) -> None:
+        slug = call.data.split(":", 1)[1]
+        if slug not in _GENRE_LABEL:
+            await call.answer("Неизвестный жанр")
+            return
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            new_state = await repo.toggle_blacklisted_genre(session, user, slug)
+            await session.commit()
+        await call.answer("🚫 Заблокирован" if new_state else "✅ Разрешён")
+        await _render_blacklist(call, edit=True)
+
+    @router.callback_query(F.data.startswith("sg:t:"))
+    async def cb_suggest_type(call: CallbackQuery) -> None:
+        parts = call.data.split(":")
+        type_slug = parts[2]
+        # Если пришёл вариант «чистый рандом» — пропускаем жанр и год
+        if len(parts) >= 4 and parts[3] == "any":
+            await call.answer()
+            await _run_suggest(call.bot, call.message.chat.id, call.from_user.id, type_slug, "any", "any")
+            return
+        if type_slug not in _TYPE_LABEL:
+            await call.answer("Неизвестный тип")
+            return
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        rows: list[list] = []
+        cur: list = []
+        for slug, label in _SUGGEST_GENRES:
+            cur.append(IKB(text=label, callback_data=f"sg:g:{type_slug}:{slug}"))
+            if len(cur) >= 2:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+        await call.answer()
+        await call.message.answer(
+            f"Выбран: <b>{_TYPE_LABEL[type_slug]}</b>\n\n"
+            "2️⃣ <b>Жанр?</b>",
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=rows),
+        )
+
+    @router.callback_query(F.data.startswith("sg:g:"))
+    async def cb_suggest_genre(call: CallbackQuery) -> None:
+        _, _, type_slug, genre_slug = call.data.split(":")
+        await call.answer()
+        # Шаг 3: год
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        rows: list[list] = []
+        cur: list = []
+        for slug, label in _SUGGEST_YEARS:
+            cur.append(IKB(text=label, callback_data=f"sg:y:{type_slug}:{genre_slug}:{slug}"))
+            if len(cur) >= 2:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+        await call.message.answer(
+            f"Выбран: <b>{_TYPE_LABEL.get(type_slug, '🎲')}</b> · <b>{_GENRE_LABEL.get(genre_slug, '🎲')}</b>\n\n"
+            "3️⃣ <b>Год выпуска?</b>",
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=rows),
+        )
+
+    @router.callback_query(F.data.startswith("sg:y:"))
+    async def cb_suggest_year(call: CallbackQuery, state: FSMContext) -> None:
+        _, _, type_slug, genre_slug, year_slug = call.data.split(":")
+        if year_slug == "custom":
+            await state.set_state(SuggestYearFSM.waiting)
+            await state.update_data(type_slug=type_slug, genre_slug=genre_slug)
+            await call.answer()
+            await call.message.answer(
+                "✏️ Введи диапазон годов через дефис.\n"
+                "Например: <code>2015-2024</code> или <code>2010-2015</code>\n"
+                "/cancel — отменить",
+                parse_mode="HTML",
+            )
+            return
+        await call.answer()
+        await _run_suggest(call.bot, call.message.chat.id, call.from_user.id, type_slug, genre_slug, year_slug)
+
+    @router.message(SuggestYearFSM.waiting, Command("cancel"))
+    async def suggest_year_cancel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer("Отменил.")
+
+    @router.message(SuggestYearFSM.waiting)
+    async def suggest_year_typed(message: Message, state: FSMContext) -> None:
+        m = re.match(r"^\s*(\d{4})\s*[-–—]\s*(\d{4})\s*$", message.text or "")
+        if not m:
+            await message.answer(
+                "Странный ввод. Нужно вроде <code>2015-2024</code>. Попробуй ещё или /cancel",
+                parse_mode="HTML",
+            )
+            return
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        if y1 > y2:
+            y1, y2 = y2, y1
+        if y1 < 1900 or y2 > 2035:
+            await message.answer("Годы 1900–2035, попробуй ещё.")
+            return
+        data = await state.get_data()
+        await state.clear()
+        year_slug = f"{y1}_{y2}"
+        # Подмешиваем в _YEAR_LABEL чтобы заголовок result'а выглядел красиво
+        _YEAR_LABEL[year_slug] = f"📅 {y1}–{y2}"
+        await _run_suggest(
+            message.bot, message.chat.id, message.from_user.id,
+            data.get("type_slug", "any"), data.get("genre_slug", "any"), year_slug,
+        )
+
+    async def _delete_prev_suggest(bot: Bot, chat_id: int, tg_user_id: int) -> None:
+        """Удаляет сообщения с прошлой подборкой если они помечены."""
+        sess = _suggest_history.get(tg_user_id)
+        if not sess or sess["cursor"] < 0:
+            return
+        prev_msg_ids = sess["batches"][sess["cursor"]].get("message_ids", [])
+        for mid in prev_msg_ids:
+            try:
+                await bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+
+    async def _run_suggest(
+        bot: Bot, chat_id: int, tg_user_id: int,
+        type_slug: str, genre_slug: str, year_slug: str = "any",
+        *, append_history: bool = True,
+    ) -> None:
+        if not groq:
+            await bot.send_message(chat_id, "🤖 Подбор от ИИ недоступен")
+            return
+        type_label = _TYPE_LABEL.get(type_slug, "🎲 Любой")
+        genre_label = _GENRE_LABEL.get(genre_slug, "🎲 Любой жанр")
+        year_label = _YEAR_LABEL.get(year_slug, "🎲 Любой год")
+        year_from = year_to = None
+        if year_slug != "any" and "_" in year_slug:
+            try:
+                year_from, year_to = (int(p) for p in year_slug.split("_"))
+            except Exception:
+                pass
+
+        loading_msg = await bot.send_message(
+            chat_id,
+            f"🪄 Готовлю подбор: <b>{type_label}</b> · <b>{genre_label}</b> · <b>{year_label}</b>…",
+            parse_mode="HTML",
+        )
+        await bot.send_chat_action(chat_id, action="typing")
+
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(session, tg_id=tg_user_id, username=None, full_name=None)
+            partner_ids: list[int] = []
+            if user.pair_id:
+                members = await repo.get_pair_members(session, user.pair_id)
+                partner_ids = [m.id for m in members if m.id != user.id]
+            my_rows = await repo.list_user_series(session, user.id, status=None)
+            partner_rows: list = []
+            if partner_ids:
+                partner_rows = await repo.list_user_series(session, partner_ids[0], status=None)
+            forbidden_genres = await repo.list_blacklisted_genres(session, user)
+
+        all_rows = my_rows + partner_rows
+        liked = sorted({s.title_ru for us, s in all_rows if us.status in ("want", "watching", "watched", "want_rewatch")})
+        disliked = sorted({s.title_ru for us, s in all_rows if us.status == "dropped"})
+        known_titles = {s.title_ru for _, s in all_rows}
+
+        # Исключаем уже показанные в этой сессии — чтобы «Дальше» давала новое
+        sess = _suggest_history.setdefault(tg_user_id, {"batches": [], "cursor": -1})
+        for b in sess["batches"]:
+            for t in b.get("titles", []):
+                known_titles.add(t)
+
+        content_type_arg = None if type_slug == "any" else type_slug
+        genre_arg = None if genre_slug == "any" else genre_slug
+
+        try:
+            suggestions = await groq.suggest_for_pair(
+                likes_a=liked, likes_b=[],
+                dislikes_a=disliked, dislikes_b=[],
+                already_in_queue=sorted(known_titles),
+                content_type=content_type_arg,
+                genre=genre_arg,
+                year_from=year_from,
+                year_to=year_to,
+                forbidden_genres=forbidden_genres or None,
+                count=5,
+            )
+        except Exception as e:
+            logger.exception("Groq suggest failed")
+            try:
+                await bot.delete_message(chat_id, loading_msg.message_id)
+            except Exception:
+                pass
+            await bot.send_message(chat_id, f"😕 ИИ заглох: {e}")
+            return
+
+        # Удаляем «готовлю…» и прошлый batch (если есть)
+        try:
+            await bot.delete_message(chat_id, loading_msg.message_id)
+        except Exception:
+            pass
+        await _delete_prev_suggest(bot, chat_id, tg_user_id)
+
+        if not suggestions:
+            await bot.send_message(
+                chat_id,
+                "🤔 ИИ устал — нечего нового предложить с этими фильтрами.\n"
+                "Попробуй ослабить требования или начать сначала: /suggest",
+            )
+            return
+
+        header_bits = ["✨ <b>Идеи от ИИ"]
+        meta_bits = []
+        if content_type_arg:
+            meta_bits.append(_TYPE_LABEL[type_slug])
+        if genre_arg:
+            meta_bits.append(_GENRE_LABEL[genre_slug])
+        if year_from or year_to:
+            meta_bits.append(year_label)
+        if meta_bits:
+            header_bits.append(" · " + " · ".join(meta_bits))
+        # Номер batch (для понимания «дальше N+1»)
+        batch_num = sess["cursor"] + (2 if append_history else 1)
+        header_bits.append(f" · стр.{batch_num} ({len(suggestions)}):</b>")
+
+        # Кнопки навигации внизу
+        from aiogram.types import InlineKeyboardButton as IKB
+        nav_row: list = []
+        if append_history and sess["cursor"] >= 0:
+            nav_row.append(IKB(text="⬅️ Назад", callback_data="sgnav:prev"))
+        elif (not append_history) and sess["cursor"] > 0:
+            nav_row.append(IKB(text="⬅️ Назад", callback_data="sgnav:prev"))
+        nav_row.append(IKB(text="🔄 Ещё 5 →", callback_data="sgnav:next"))
+        nav_kb = [nav_row, [IKB(text="🎚 Новые фильтры", callback_data="sgnav:restart")]]
+
+        msg_ids, _ = await send_suggestions_gallery(
+            bot, chat_id, suggestions, kp,
+            header="".join(header_bits), extra_kb=nav_kb,
+        )
+
+        # Сохраняем в историю
+        new_batch = {
+            "type": type_slug,
+            "genre": genre_slug,
+            "year": year_slug,
+            "titles": [s.title for s in suggestions],
+            "message_ids": msg_ids,
+        }
+        if append_history:
+            # Срезаем «forward» если юзер был не на хвосте (после Назад)
+            sess["batches"] = sess["batches"][: sess["cursor"] + 1]
+            sess["batches"].append(new_batch)
+            sess["cursor"] = len(sess["batches"]) - 1
+        else:
+            # Это переход назад/перерендер — заменяем текущий
+            sess["batches"][sess["cursor"]] = new_batch
+
+    @router.callback_query(F.data.startswith("sgnav:"))
+    async def cb_suggest_nav(call: CallbackQuery) -> None:
+        action = call.data.split(":")[1]
+        sess = _suggest_history.get(call.from_user.id)
+        if not sess or not sess.get("batches"):
+            await call.answer("Подборки нет. Начни заново: /suggest", show_alert=True)
+            return
+        if action == "restart":
+            await call.answer()
+            # Очищаем историю и предложение, заводим заново
+            await _delete_prev_suggest(call.bot, call.message.chat.id, call.from_user.id)
+            _suggest_history.pop(call.from_user.id, None)
+            await cmd_suggest(call.message)
+            return
+        if action == "next":
+            # Новый batch с теми же фильтрами
+            current = sess["batches"][sess["cursor"]]
+            await call.answer("🔄 Подбираю ещё…")
+            await _run_suggest(
+                call.bot, call.message.chat.id, call.from_user.id,
+                current["type"], current["genre"], current["year"],
+                append_history=True,
+            )
+            return
+        if action == "prev":
+            if sess["cursor"] <= 0:
+                await call.answer("Это первая подборка", show_alert=True)
+                return
+            await call.answer("⬅️ Возвращаюсь")
+            # Удаляем текущий batch (сообщения)
+            await _delete_prev_suggest(call.bot, call.message.chat.id, call.from_user.id)
+            # Удаляем текущий batch из истории (мы возвращаемся «налево»)
+            sess["batches"].pop(sess["cursor"])
+            sess["cursor"] -= 1
+            # Перерендерим предыдущий
+            prev = sess["batches"][sess["cursor"]]
+            # Удаляем его и из истории и заново показываем (чтоб message_ids обновились)
+            sess["batches"].pop(sess["cursor"])
+            sess["cursor"] -= 1
+            await _run_suggest(
+                call.bot, call.message.chat.id, call.from_user.id,
+                prev["type"], prev["genre"], prev["year"],
+                append_history=True,
+            )
 
     # ============== /swipe — Tinder для новых сериалов ==============
     @router.message(Command("swipe"))

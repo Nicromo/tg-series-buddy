@@ -196,6 +196,12 @@ class GroqClient:
         dislikes_b: list[str],
         already_in_queue: list[str],
         mood_hint: Optional[str] = None,
+        content_type: Optional[str] = None,  # "series"|"movie"|"animation"|None
+        genre: Optional[str] = None,  # «драма» / «триллер» / None
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        forbidden_genres: Optional[list[str]] = None,
+        count: int = 5,
     ) -> list[SuggestedSeries]:
         system = (
             "Ты — рекомендатель сериалов для пары. Отдай ТОЛЬКО JSON "
@@ -215,10 +221,30 @@ class GroqClient:
             bits.append(f"Уже в очереди (НЕ предлагать): {', '.join(already_in_queue[:20])}")
         if mood_hint:
             bits.append(f"Настроение: {mood_hint}")
+        if genre:
+            bits.append(f"Жанр: {genre}")
+        type_hint = {
+            "series": "СТРОГО сериал (не фильм, не мультфильм)",
+            "movie": "СТРОГО полнометражный фильм (не сериал, не мультфильм)",
+            "animation": "СТРОГО мультфильм или анимационный сериал",
+        }.get(content_type or "")
+        if type_hint:
+            bits.append(f"Тип контента: {type_hint}")
+        else:
+            bits.append("Тип: сериал или фильм — на твой выбор")
+        if year_from or year_to:
+            yf = year_from or 1900
+            yt = year_to or 2030
+            bits.append(f"Год выпуска: СТРОГО {yf}-{yt}")
+        if forbidden_genres:
+            bits.append(
+                f"ЗАПРЕЩЁННЫЕ жанры — НИКОГДА не предлагать: {', '.join(forbidden_genres)}"
+            )
 
+        final_kind = type_hint or "сериала или фильма"
         user = (
-            ("\n".join(bits) if bits else "Истории мало — предложи популярные сериалы.")
-            + "\n\nПредложи 3 сериала которые зайдут ОБОИМ. JSON items."
+            ("\n".join(bits) if bits else "Истории мало — предложи популярные тайтлы.")
+            + f"\n\nПредложи {count} варианта которые зайдут ОБОИМ. JSON items."
         )
 
         try:
@@ -226,7 +252,7 @@ class GroqClient:
             data = json.loads(raw)
             items = data.get("items", [])
             result: list[SuggestedSeries] = []
-            for it in items[:3]:
+            for it in items[:count]:
                 title = (it.get("title") or "").strip()
                 if not title:
                     continue

@@ -36,8 +36,10 @@ BOT_COMMANDS = [
     BotCommand(command="pair",     description="👫 Связаться с партнёром"),
     BotCommand(command="subs",     description="📺 YouTube подписки"),
     BotCommand(command="suggest",  description="🪄 Подбор от ИИ"),
+    BotCommand(command="blacklist", description="🚫 Жанры-табу для ИИ"),
     BotCommand(command="swipe",    description="🃏 Свайп-вечер"),
     BotCommand(command="stats",    description="📊 Статистика"),
+    BotCommand(command="donate",   description="💛 Поддержать бота"),
     BotCommand(command="menu",     description="✨ Главное меню"),
 ]
 
