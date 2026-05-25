@@ -647,24 +647,50 @@ def make_router(
         await call.answer()
 
     # ============== Списки с пагинацией ==============
+    DIGIT_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
     async def _send_list(message: Message, status: str, empty_msg: str, *, header: str = "") -> None:
         async with session_factory() as session:
             rows = await repo.list_user_series(session, message.from_user.id, status=status)
         if not rows:
             await message.answer(empty_msg)
             return
-        if header:
-            await message.answer(f"{header}  ·  {len(rows)} шт.", parse_mode="HTML")
 
-        # Отправляем полноценные карточки с постером и кнопками
-        for us, series in rows[:10]:
-            await _send_card(
-                message.bot, message.chat.id, series,
-                user_status=us.status, user_rating=us.rating, note=us.notes,
-            )
-
-        # Дополнительные кнопки внизу — bulk + random
+        items = rows[:10]
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+
+        # Галерея постеров (без подписи — заголовок отдельным сообщением)
+        media = [InputMediaPhoto(media=s.poster_url) for _, s in items if s.poster_url]
+        if len(media) >= 2:
+            try:
+                await message.bot.send_media_group(message.chat.id, media[:10])
+            except Exception as e:
+                logger.warning("send_media_group failed for /%s list: %s", status, e)
+
+        # Текст: заголовок + пронумерованный список
+        title = header or "Список"
+        lines = [f"{title}  ·  {len(rows)} шт.", ""]
+        for i, (us, s) in enumerate(items, 1):
+            marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
+            year_str = f" ({s.year})" if s.year else ""
+            rating_str = f" ⭐{s.rating_kp:.1f}" if s.rating_kp else ""
+            lines.append(f"{marker} <b>{s.title_ru}</b>{year_str}{rating_str}")
+        if len(rows) > 10:
+            lines.append("")
+            lines.append(f"<i>… показал первые 10 из {len(rows)}. /find для поиска.</i>")
+
+        # Кнопки 1-N (по 5 в ряд)
+        btn_rows: list[list] = []
+        cur: list = []
+        for i, (_, s) in enumerate(items, 1):
+            cur.append(IKB(text=str(i), callback_data=f"open:{s.id}"))
+            if len(cur) >= 5:
+                btn_rows.append(cur)
+                cur = []
+        if cur:
+            btn_rows.append(cur)
+
+        # Доп. кнопки
         action_row = []
         if status == "want":
             action_row.append(IKB(text="🎲 Случайный", callback_data="open_random:want"))
@@ -673,9 +699,14 @@ def make_router(
         elif status == "watching" and len(rows) >= 2:
             action_row.append(IKB(text=f"✅ Все досмотрел ({len(rows)})", callback_data="bulk:watching:watched"))
         if action_row:
-            await message.answer("⬇️ Что дальше:", reply_markup=IKM(inline_keyboard=[action_row]))
-        if len(rows) > 10:
-            await message.answer(f"… показал первые 10 из {len(rows)}. Используй /find для поиска по списку.")
+            btn_rows.append(action_row)
+
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=btn_rows),
+            disable_web_page_preview=True,
+        )
 
     @router.message(Command("list"))
     async def cmd_list(message: Message) -> None:
@@ -775,14 +806,46 @@ def make_router(
         if not matches:
             await message.answer("💛 Пока нет общих лайков. Лайкайте сериалы — будет!")
             return
+
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        items = matches[:10]
+
+        # Галерея постеров
+        media = [InputMediaPhoto(media=s.poster_url) for s in items if s.poster_url]
+        if len(media) >= 2:
+            try:
+                await message.bot.send_media_group(message.chat.id, media[:10])
+            except Exception as e:
+                logger.warning("send_media_group failed for /match: %s", e)
+
+        # Текст + кнопки
+        lines = [f"💛 <b>Лайкнули оба ({len(matches)}):</b>", ""]
+        for i, s in enumerate(items, 1):
+            marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
+            year_str = f" ({s.year})" if s.year else ""
+            rating_str = f" ⭐{s.rating_kp:.1f}" if s.rating_kp else ""
+            lines.append(f"{marker} <b>{s.title_ru}</b>{year_str}{rating_str}")
+        if len(matches) > 10:
+            lines.append("")
+            lines.append(f"<i>… показал первые 10 из {len(matches)}.</i>")
+
+        btn_rows: list[list] = []
+        cur: list = []
+        for i, s in enumerate(items, 1):
+            cur.append(IKB(text=str(i), callback_data=f"open:{s.id}"))
+            if len(cur) >= 5:
+                btn_rows.append(cur)
+                cur = []
+        if cur:
+            btn_rows.append(cur)
+        btn_rows.append([IKB(text="🎲 Случайный из общих", callback_data="match_random:0")])
+
         await message.answer(
-            f"💛 <b>Лайкнули оба ({len(matches)}):</b>",
+            "\n".join(lines),
             parse_mode="HTML",
-            reply_markup=IKM(inline_keyboard=[[IKB(text="🎲 Случайный из общих", callback_data="match_random:0")]]),
+            reply_markup=IKM(inline_keyboard=btn_rows),
+            disable_web_page_preview=True,
         )
-        for series in matches[:10]:
-            await _send_card(message.bot, message.chat.id, series)
 
     @router.callback_query(F.data.startswith("match_random:"))
     async def cb_match_random(call: CallbackQuery) -> None:
