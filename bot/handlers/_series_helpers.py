@@ -14,11 +14,17 @@ from typing import Optional
 
 from aiogram import Bot
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+)
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ..db import repository as repo
 from ..db.models import Series
 from ..keyboards.series_kb import card_keyboard
+from ..services.groq_ai import SuggestedSeries
 from ..services.kinopoisk import KPDetails, KinopoiskClient
 
 logger = logging.getLogger(__name__)
@@ -233,3 +239,86 @@ async def add_by_kp_id(
             parse_mode="HTML",
         )
     await send_card(bot, chat_id, series, user_status=status, user_rating=rating, note=note)
+
+
+async def send_suggestions_gallery(
+    bot: Bot,
+    chat_id: int,
+    suggestions: list[SuggestedSeries],
+    kp: KinopoiskClient,
+    *,
+    header: str = "✨ <b>Идеи от ИИ:</b>",
+) -> None:
+    """Универсальный рендер «галерея постеров + список + add/trailer кнопки».
+    Используется в /suggest и в «похожие на этот»."""
+    items: list[tuple] = []
+    for sug in suggestions[:3]:
+        query = f"{sug.title} {sug.year}" if sug.year else sug.title
+        try:
+            hits = await kp.search(query, limit=1)
+            if hits:
+                items.append((sug, hits[0]))
+        except Exception as e:
+            logger.warning("KP search for suggestion failed: %s", e)
+
+    if not items:
+        # Фолбэк — текст без постеров
+        await bot.send_message(chat_id, header, parse_mode="HTML")
+        for sug in suggestions:
+            txt = f"🎬 <b>{sug.title}</b>"
+            if sug.year:
+                txt += f" ({sug.year})"
+            if sug.why:
+                txt += f"\n💡 <i>{sug.why}</i>"
+            txt += f"\n\nДобавить? <code>/add {sug.title}</code>"
+            await bot.send_message(chat_id, txt, parse_mode="HTML")
+        return
+
+    # Подпись к первому фото — компактный список (лимит 1024)
+    list_lines: list[str] = [header, ""]
+    for i, (sug, hit) in enumerate(items, 1):
+        title = hit.title_ru or sug.title
+        year = hit.year or sug.year
+        year_str = f" ({year})" if year else ""
+        rating_str = f" · ⭐{hit.rating_kp:.1f}" if hit.rating_kp else ""
+        list_lines.append(f"<b>{i}. {title}</b>{year_str}{rating_str}")
+        if sug.why:
+            list_lines.append(f"💡 <i>{sug.why}</i>")
+        list_lines.append("")
+    caption = "\n".join(list_lines).rstrip()
+    if len(caption) > 1024:
+        caption = caption[:1020].rstrip() + "…"
+
+    media = []
+    for i, (_, hit) in enumerate(items):
+        if not hit.poster_url:
+            continue
+        if not media:
+            media.append(InputMediaPhoto(media=hit.poster_url, caption=caption, parse_mode="HTML"))
+        else:
+            media.append(InputMediaPhoto(media=hit.poster_url))
+
+    sent_caption = False
+    if len(media) >= 2:
+        try:
+            await bot.send_media_group(chat_id, media)
+            sent_caption = True
+        except Exception as e:
+            logger.warning("send_media_group failed for suggestions: %s", e)
+    elif len(media) == 1:
+        try:
+            m = media[0]
+            await bot.send_photo(chat_id, photo=m.media, caption=caption, parse_mode="HTML")
+            sent_caption = True
+        except Exception as e:
+            logger.warning("send_photo failed for suggestions: %s", e)
+    if not sent_caption:
+        await bot.send_message(chat_id, caption, parse_mode="HTML")
+
+    add_row = [InlineKeyboardButton(text=f"➕ {i}", callback_data=f"addkp:{hit.kp_id}") for i, (_, hit) in enumerate(items, 1)]
+    trailer_row = [InlineKeyboardButton(text=f"🎬 {i}", callback_data=f"trkp:{hit.kp_id}") for i, (_, hit) in enumerate(items, 1)]
+    await bot.send_message(
+        chat_id,
+        "Что делаем? 👇",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[add_row, trailer_row]),
+    )

@@ -49,6 +49,7 @@ from ._series_helpers import (
     details_to_series_dict as _details_to_series_dict,
     format_caption as _format_caption,
     send_card as _send_card,
+    send_suggestions_gallery,
 )
 
 logger = logging.getLogger(__name__)
@@ -336,6 +337,47 @@ def make_router(
             await repo.set_user_series_rating(session, call.from_user.id, series_id, rating)
             await session.commit()
         await call.answer(f"Принято: {RATING_LABELS.get(rating, rating)}")
+        # После лайка — предложить похожие через Groq
+        if rating == "like" and groq:
+            from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+            await call.message.answer(
+                "👍 Зашло? Подобрать похожие?",
+                reply_markup=IKM(inline_keyboard=[[
+                    IKB(text="🎬 Похожие сериалы", callback_data=f"simto:{series_id}")
+                ]]),
+            )
+
+    @router.callback_query(F.data.startswith("simto:"))
+    async def cb_similar_to(call: CallbackQuery) -> None:
+        if not groq:
+            await call.answer("Подбор ИИ недоступен")
+            return
+        series_id = int(call.data.split(":")[1])
+        async with session_factory() as session:
+            series = await session.get(Series, series_id)
+            if series is None:
+                await call.answer("Сериал не найден")
+                return
+            # Что уже знает юзер — не предлагать
+            all_rows = await repo.list_user_series(session, call.from_user.id, status=None)
+            already = [s.title_ru for _, s in all_rows]
+        await call.answer("Ищу похожие…")
+        await call.bot.send_chat_action(call.message.chat.id, action="typing")
+        try:
+            suggestions = await groq.similar_to(
+                title=series.title_ru, year=series.year, already_in_queue=already,
+            )
+        except Exception as e:
+            logger.exception("Groq similar_to failed")
+            await call.message.answer(f"😕 ИИ заглох: {e}")
+            return
+        if not suggestions:
+            await call.message.answer("🤔 Не получилось придумать похожие.")
+            return
+        await send_suggestions_gallery(
+            call.bot, call.message.chat.id, suggestions, kp,
+            header=f"🎬 <b>Похожие на «{series.title_ru}»:</b>",
+        )
 
     # ============== Weekly check-in (ck:) ==============
     @router.callback_query(F.data.startswith("ck:"))
@@ -837,81 +879,9 @@ def make_router(
             await message.answer("🤔 Не получилось придумать. Попробуй позже.")
             return
 
-        # Для каждого предложения ищем в KP — нужны постеры и kp_id для кнопок
-        items: list = []  # list[tuple[SuggestedSeries, KPSearchHit]]
-        for sug in suggestions[:3]:
-            query = f"{sug.title} {sug.year}" if sug.year else sug.title
-            try:
-                hits = await kp.search(query, limit=1)
-                if hits:
-                    items.append((sug, hits[0]))
-            except Exception as e:
-                logger.warning("KP search for suggestion failed: %s", e)
-
-        # Если ничего не нашли в KP — фолбэк на старый текстовый формат
-        if not items:
-            await message.answer(f"✨ <b>Идеи от ИИ ({len(suggestions)}):</b>", parse_mode="HTML")
-            for sug in suggestions:
-                txt = f"🎬 <b>{sug.title}</b>"
-                if sug.year:
-                    txt += f" ({sug.year})"
-                if sug.why:
-                    txt += f"\n💡 <i>{sug.why}</i>"
-                txt += f"\n\nДобавить? <code>/add {sug.title}</code>"
-                await message.answer(txt, parse_mode="HTML")
-            return
-
-        # Компактный список для подписи к первому фото (лимит 1024)
-        list_lines: list[str] = [f"✨ <b>Идеи от ИИ ({len(items)}):</b>", ""]
-        for i, (sug, hit) in enumerate(items, 1):
-            title = hit.title_ru or sug.title
-            year = hit.year or sug.year
-            year_str = f" ({year})" if year else ""
-            rating_str = f" · ⭐{hit.rating_kp:.1f}" if hit.rating_kp else ""
-            list_lines.append(f"<b>{i}. {title}</b>{year_str}{rating_str}")
-            if sug.why:
-                list_lines.append(f"💡 <i>{sug.why}</i>")
-            list_lines.append("")
-        caption = "\n".join(list_lines).rstrip()
-        if len(caption) > 1024:
-            caption = caption[:1020].rstrip() + "…"
-
-        # media_group из постеров (Telegram требует 2-10 фото)
-        media = []
-        for i, (sug, hit) in enumerate(items):
-            if not hit.poster_url:
-                continue
-            if i == 0 or not media:
-                media.append(InputMediaPhoto(media=hit.poster_url, caption=caption, parse_mode="HTML"))
-            else:
-                media.append(InputMediaPhoto(media=hit.poster_url))
-
-        sent_caption = False
-        if len(media) >= 2:
-            try:
-                await message.bot.send_media_group(message.chat.id, media)
-                sent_caption = True
-            except Exception as e:
-                logger.warning("send_media_group failed for /suggest: %s", e)
-        elif len(media) == 1:
-            try:
-                m = media[0]
-                await message.bot.send_photo(
-                    message.chat.id, photo=m.media, caption=caption, parse_mode="HTML",
-                )
-                sent_caption = True
-            except Exception as e:
-                logger.warning("send_photo failed for /suggest: %s", e)
-        if not sent_caption:
-            await message.answer(caption, parse_mode="HTML")
-
-        # Inline-кнопки: ряд добавить + ряд трейлер
-        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
-        add_row = [IKB(text=f"➕ {i}", callback_data=f"addkp:{hit.kp_id}") for i, (_, hit) in enumerate(items, 1)]
-        trailer_row = [IKB(text=f"🎬 {i}", callback_data=f"trkp:{hit.kp_id}") for i, (_, hit) in enumerate(items, 1)]
-        await message.answer(
-            "Что делаем? 👇",
-            reply_markup=IKM(inline_keyboard=[add_row, trailer_row]),
+        await send_suggestions_gallery(
+            message.bot, message.chat.id, suggestions, kp,
+            header=f"✨ <b>Идеи от ИИ ({len(suggestions)}):</b>",
         )
 
     @router.message(F.text == "✨ Подобрать")

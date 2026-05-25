@@ -147,6 +147,46 @@ class GroqClient:
             logger.warning("mood_search failed: %s", e)
             return []
 
+    async def similar_to(
+        self,
+        *,
+        title: str,
+        year: Optional[int] = None,
+        already_in_queue: Optional[list[str]] = None,
+    ) -> list[SuggestedSeries]:
+        """3 похожих на (title, year). Не предлагает то, что уже в queue."""
+        system = (
+            "Ты — рекомендатель сериалов и фильмов. Юзер лайкнул один и хочет похожих. "
+            'Отдай ТОЛЬКО JSON {"items":[{"title":"...","year":2020,"why":"..."}]}. '
+            "Title — русский или оригинал. Why — короткая фраза, чем похоже."
+        )
+        base = f"Юзер лайкнул: {title}"
+        if year:
+            base += f" ({year})"
+        bits = [base]
+        if already_in_queue:
+            bits.append(f"НЕ предлагать (уже знает): {', '.join(already_in_queue[:20])}")
+        user = "\n".join(bits) + "\n\nПредложи 3 похожих. JSON items."
+        try:
+            raw = await self.chat(system, user, json_mode=True)
+            data = json.loads(raw)
+            items = data.get("items", [])
+            result: list[SuggestedSeries] = []
+            for it in items[:3]:
+                t = (it.get("title") or "").strip()
+                if not t:
+                    continue
+                y = it.get("year")
+                if isinstance(y, str) and y.isdigit():
+                    y = int(y)
+                elif not isinstance(y, int):
+                    y = None
+                result.append(SuggestedSeries(title=t, year=y, why=it.get("why") or ""))
+            return result
+        except Exception as e:
+            logger.warning("Groq similar_to failed: %s", e)
+            return []
+
     async def suggest_for_pair(
         self,
         *,
