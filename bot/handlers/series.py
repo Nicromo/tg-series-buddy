@@ -1487,6 +1487,201 @@ def make_router(
             # Чистим
             _polls.pop(poll_id, None)
 
+    # ============== /cinema — афиша в твоём городе ==============
+    # Slug'и Кинопоиска для главных городов России (для URL .../afisha/new/city/<slug>/)
+    _CINEMA_CITIES = [
+        ("moscow",            "Москва"),
+        ("saint-petersburg",  "Санкт-Петербург"),
+        ("novosibirsk",       "Новосибирск"),
+        ("ekaterinburg",      "Екатеринбург"),
+        ("nizhny-novgorod",   "Нижний Новгород"),
+        ("kazan",             "Казань"),
+        ("chelyabinsk",       "Челябинск"),
+        ("samara",            "Самара"),
+        ("rostov-na-donu",    "Ростов-на-Дону"),
+        ("ufa",                "Уфа"),
+        ("krasnoyarsk",       "Красноярск"),
+        ("voronezh",          "Воронеж"),
+        ("perm",              "Пермь"),
+        ("volgograd",         "Волгоград"),
+        ("krasnodar",         "Краснодар"),
+    ]
+    _CITY_BY_SLUG = dict(_CINEMA_CITIES)
+
+    class CityFSM(StatesGroup):
+        waiting = State()
+
+    def _city_picker_kb():
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        rows: list[list] = []
+        cur: list = []
+        for slug, name in _CINEMA_CITIES:
+            cur.append(IKB(text=name, callback_data=f"city:{slug}"))
+            if len(cur) >= 2:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+        rows.append([IKB(text="🌍 Другой город — введу сам", callback_data="city:other")])
+        return IKM(inline_keyboard=rows)
+
+    async def _send_cinema_for_city(bot: Bot, chat_id: int, city_slug: str, city_name: str) -> None:
+        await bot.send_chat_action(chat_id, action="typing")
+        try:
+            hits = await kp.get_movies_in_theaters(limit=15)
+        except Exception as e:
+            await bot.send_message(chat_id, f"😕 KP заглох: {e}")
+            return
+        if not hits:
+            await bot.send_message(chat_id, "🎫 Сейчас в прокате ничего не нашлось у KP.")
+            return
+
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+
+        # media_group из постеров
+        media = [InputMediaPhoto(media=h.poster_url) for h in hits[:10] if h.poster_url]
+        if len(media) >= 2:
+            try:
+                await bot.send_media_group(chat_id, media[:10])
+            except Exception as e:
+                logger.warning("send_media_group failed for /cinema: %s", e)
+
+        afisha_url = f"https://www.kinopoisk.ru/afisha/new/city/{city_slug}/"
+        lines = [
+            f"🎫 <b>В прокате · {city_name}</b>",
+            "",
+        ]
+        for i, h in enumerate(hits[:10], 1):
+            year_str = f" ({h.year})" if h.year else ""
+            rating_str = f" ⭐{h.rating_kp:.1f}" if h.rating_kp else ""
+            marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
+            lines.append(f"{marker} <b>{h.title_ru}</b>{year_str}{rating_str}")
+        lines.append("")
+        lines.append(f"<i>🎟 Полная афиша с сеансами — на Кинопоиске:</i>")
+        lines.append(afisha_url)
+
+        # Кнопки: открыть афишу города (URL-кнопка) + сеансы для каждого фильма + смена города
+        rows: list[list] = [
+            [IKB(text=f"🎫 Открыть афишу {city_name}", url=afisha_url)],
+        ]
+        # Для каждого фильма — отдельная кнопка-URL с прямым переходом
+        for i, h in enumerate(hits[:6], 1):
+            short = h.title_ru[:22] + "…" if len(h.title_ru) > 22 else h.title_ru
+            sessions_url = f"https://www.kinopoisk.ru/film/{h.kp_id}/sessions/city/{city_slug}/"
+            rows.append([IKB(text=f"🎟 Сеансы — {short}", url=sessions_url)])
+        rows.append([IKB(text="📍 Сменить город", callback_data="cinema:change_city")])
+
+        await bot.send_message(
+            chat_id,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=rows),
+            disable_web_page_preview=True,
+        )
+
+    @router.message(Command("cinema"))
+    async def cmd_cinema(message: Message) -> None:
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            saved_city = user.city
+        if saved_city and saved_city in _CITY_BY_SLUG:
+            await _send_cinema_for_city(
+                message.bot, message.chat.id, saved_city, _CITY_BY_SLUG[saved_city],
+            )
+            return
+        if saved_city:
+            # Юзер ввёл произвольный город — используем его slug как есть
+            await _send_cinema_for_city(
+                message.bot, message.chat.id, saved_city, saved_city.replace("-", " ").title(),
+            )
+            return
+        await message.answer(
+            "🎫 <b>Какой у вас город?</b>\n"
+            "(сохраню, чтобы потом не спрашивать)",
+            parse_mode="HTML",
+            reply_markup=_city_picker_kb(),
+        )
+
+    @router.callback_query(F.data == "cinema:change_city")
+    async def cb_cinema_change_city(call: CallbackQuery) -> None:
+        await call.answer()
+        await call.message.answer(
+            "📍 <b>Выбери город:</b>",
+            parse_mode="HTML",
+            reply_markup=_city_picker_kb(),
+        )
+
+    @router.callback_query(F.data.startswith("city:"))
+    async def cb_city_picked(call: CallbackQuery, state: FSMContext) -> None:
+        slug = call.data.split(":", 1)[1]
+        if slug == "other":
+            await state.set_state(CityFSM.waiting)
+            await call.answer()
+            await call.message.answer(
+                "✏️ Введи название города по-русски или его slug на КП.\n"
+                "Примеры: <code>сочи</code>, <code>vladivostok</code>. "
+                "Если slug неверный — Кинопоиск покажет общую афишу.\n"
+                "/cancel чтобы отменить.",
+                parse_mode="HTML",
+            )
+            return
+        # Знакомый slug из списка
+        if slug not in _CITY_BY_SLUG:
+            await call.answer("Неизвестный город", show_alert=True)
+            return
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            user.city = slug
+            await session.commit()
+        await call.answer(f"📍 {_CITY_BY_SLUG[slug]}")
+        await _send_cinema_for_city(
+            call.bot, call.message.chat.id, slug, _CITY_BY_SLUG[slug],
+        )
+
+    @router.message(CityFSM.waiting, Command("cancel"))
+    async def cb_city_cancel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer("Отменил.")
+
+    @router.message(CityFSM.waiting)
+    async def cb_city_typed(message: Message, state: FSMContext) -> None:
+        raw = (message.text or "").strip()
+        if not raw or len(raw) > 64:
+            await message.answer("Странный город. Попробуй ещё раз или /cancel")
+            return
+        # Эвристика: если уже похоже на slug (латиница с дефисами) — используем как есть.
+        # Иначе пробуем перевести в slug через простой transliterate.
+        if re.fullmatch(r"[a-z0-9-]+", raw.lower()):
+            slug = raw.lower()
+            display = slug.replace("-", " ").title()
+        else:
+            # Простая транслитерация ru → kinopoisk slug
+            translit = {
+                "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh",
+                "з":"z","и":"i","й":"y","к":"k","л":"l","м":"m","н":"n","о":"o",
+                "п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"h","ц":"ts",
+                "ч":"ch","ш":"sh","щ":"shch","ъ":"","ы":"y","ь":"","э":"e",
+                "ю":"yu","я":"ya"," ":"-",
+            }
+            slug = "".join(translit.get(ch, ch) for ch in raw.lower())
+            slug = re.sub(r"[^a-z0-9-]", "", slug)
+            display = raw.title()
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            user.city = slug
+            await session.commit()
+        await state.clear()
+        await _send_cinema_for_city(message.bot, message.chat.id, slug, display)
+
     # ============== /upcoming — премьеры под жанры пары ==============
     @router.message(Command("upcoming"))
     async def cmd_upcoming(message: Message) -> None:

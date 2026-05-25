@@ -30,6 +30,7 @@ BOT_COMMANDS = [
     BotCommand(command="list",     description="📋 Наш общий список «хочу»"),
     BotCommand(command="watching", description="▶️ Смотрим сейчас"),
     BotCommand(command="upcoming", description="📅 Премьеры под ваши жанры"),
+    BotCommand(command="cinema",   description="🎫 Что в кино в твоём городе"),
     BotCommand(command="poll",     description="🗳 Выбираем вместе"),
     BotCommand(command="where",    description="📺 Где смотреть"),
     BotCommand(command="pair",     description="👫 Связаться с партнёром"),

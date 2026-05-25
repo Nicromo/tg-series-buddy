@@ -46,6 +46,8 @@ class User(Base):
     full_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     pair_id: Mapped[Optional[int]] = mapped_column(ForeignKey("pairs.id"), nullable=True, index=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+    # Для /cinema — сохранённый город (kinopoisk slug, например "moscow")
+    city: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     pair: Mapped[Optional[Pair]] = relationship(back_populates="users")
 
