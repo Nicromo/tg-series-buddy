@@ -18,7 +18,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 def utcnow() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
