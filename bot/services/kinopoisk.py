@@ -244,6 +244,50 @@ class KinopoiskClient:
 
     # ---------- Детали ----------
 
+    async def get_trending(
+        self, *, min_rating: float = 7.0, days_back: int = 60,
+        is_series: Optional[bool] = None, limit: int = 15,
+    ) -> list[KPSearchHit]:
+        """«Громкие новинки» — фильмы/сериалы с рейтингом >= min_rating
+        с премьерой в последние N дней или сейчас. Сортировка по rating.kp DESC.
+        """
+        import datetime as _dt
+        today = _dt.date.today()
+        past = today - _dt.timedelta(days=days_back)
+        future = today + _dt.timedelta(days=14)
+        params = {
+            "limit": str(limit),
+            "page": "1",
+            "rating.kp": f"{min_rating}-10",
+            "premiere.world": f"{past.strftime('%d.%m.%Y')}-{future.strftime('%d.%m.%Y')}",
+            "sortField": "rating.kp",
+            "sortType": "-1",
+        }
+        if is_series is True:
+            params["isSeries"] = "true"
+        elif is_series is False:
+            params["isSeries"] = "false"
+        try:
+            resp = await self._client.get("/movie", params=params)
+            resp.raise_for_status()
+            docs = resp.json().get("docs", [])
+        except Exception:
+            return []
+        hits: list[KPSearchHit] = []
+        for d in docs:
+            poster = (d.get("poster") or {}).get("url") or (d.get("poster") or {}).get("previewUrl")
+            rating_kp = (d.get("rating") or {}).get("kp")
+            hits.append(KPSearchHit(
+                kp_id=int(d["id"]),
+                title_ru=d.get("name") or d.get("alternativeName") or "?",
+                title_en=d.get("alternativeName"),
+                year=d.get("year"),
+                poster_url=poster,
+                short_description=d.get("shortDescription") or d.get("description"),
+                rating_kp=float(rating_kp) if rating_kp else None,
+            ))
+        return hits
+
     async def get_movies_in_theaters(self, *, limit: int = 15) -> list[KPSearchHit]:
         """Фильмы в прокате — премьера в России за последние 30 дней
         или в ближайшие 45. Сортировка по дате премьеры RU DESC.

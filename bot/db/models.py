@@ -48,6 +48,8 @@ class User(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
     # Для /cinema — сохранённый город (kinopoisk slug, например "moscow")
     city: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Минимальный рейтинг КП для /trending и фильтра предложений (0.0-10.0)
+    min_rating: Mapped[Optional[float]] = mapped_column(nullable=True)
 
     pair: Mapped[Optional[Pair]] = relationship(back_populates="users")
 

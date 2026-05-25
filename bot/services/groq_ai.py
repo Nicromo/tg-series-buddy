@@ -279,6 +279,7 @@ class GroqClient:
         year_from: Optional[int] = None,
         year_to: Optional[int] = None,
         forbidden_genres: Optional[list[str]] = None,
+        country: Optional[str] = None,
         count: int = 5,
     ) -> list[SuggestedSeries]:
         system = (
@@ -317,6 +318,8 @@ class GroqClient:
             bits.append(
                 f"ЗАПРЕЩЁННЫЕ жанры — НИКОГДА не предлагать: {', '.join(forbidden_genres)}"
             )
+        if country:
+            bits.append(f"Страна производства: СТРОГО {country}")
 
         final_kind = type_hint or "сериала или фильма"
         user = (

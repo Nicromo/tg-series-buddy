@@ -1895,6 +1895,196 @@ def make_router(
         await state.clear()
         await _send_cinema_for_city(message.bot, message.chat.id, slug, display)
 
+    # ============== /profile — настройки + статистика ==============
+    class MinRatingFSM(StatesGroup):
+        waiting = State()
+
+    async def _render_profile(message_or_call, edit: bool = False) -> None:
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        if isinstance(message_or_call, CallbackQuery):
+            tg_id = message_or_call.from_user.id
+            chat_id = message_or_call.message.chat.id
+            from_user = message_or_call.from_user
+            bot_obj = message_or_call.bot
+        else:
+            tg_id = message_or_call.from_user.id
+            chat_id = message_or_call.chat.id
+            from_user = message_or_call.from_user
+            bot_obj = message_or_call.bot
+
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=tg_id,
+                username=from_user.username, full_name=from_user.full_name,
+            )
+            rows = await repo.list_user_series(session, user.id, status=None)
+            blocked_genres = await repo.list_blacklisted_genres(session, user)
+            partner_name = None
+            if user.pair_id:
+                members = await repo.get_pair_members(session, user.pair_id)
+                for m in members:
+                    if m.id != user.id:
+                        partner_name = m.full_name or (f"@{m.username}" if m.username else f"id={m.id}")
+                        break
+
+        # Stats
+        st_count = Counter(us.status for us, _ in rows)
+        genre_counter: Counter = Counter()
+        for us, s in rows:
+            if us.status in ("want", "watching", "watched", "want_rewatch") and s.genres:
+                for g in s.genres.split(","):
+                    g = g.strip()
+                    if g:
+                        genre_counter[g] += 1
+        top_genres = ", ".join(g for g, _ in genre_counter.most_common(5)) or "—"
+
+        min_rating = user.min_rating if user.min_rating is not None else 7.0
+        city_label = user.city or "не выбран"
+
+        lines = [
+            f"👤 <b>Профиль · {from_user.full_name or '@'+(from_user.username or '')}</b>",
+            "",
+            f"👫 Пара: <b>{partner_name}</b>" if partner_name else "👫 Пара: <i>не настроена</i> (см. /pair)",
+            f"📍 Город для /cinema: <b>{city_label}</b>",
+            f"⭐ Мин. рейтинг для /trending и подсказок: <b>{min_rating:.1f}</b>",
+            f"🚫 Заблокировано жанров: <b>{len(blocked_genres)}</b>",
+            "",
+            "📊 <b>Статистика:</b>",
+            f"📺 Всего: <b>{len(rows)}</b>",
+            f"👀 Хочу: {st_count.get('want', 0)}",
+            f"▶️ Смотрю: {st_count.get('watching', 0)}",
+            f"✅ Досмотрел: {st_count.get('watched', 0)}",
+            f"🔁 Пересмотр: {st_count.get('want_rewatch', 0)}",
+            f"❌ Дропнул: {st_count.get('dropped', 0)}",
+            f"🎭 Топ жанры: <i>{top_genres}</i>",
+        ]
+
+        rows_kb = [
+            [IKB(text=f"⭐ Сменить мин. рейтинг ({min_rating:.1f})", callback_data="prof:rating")],
+            [IKB(text="📍 Сменить город", callback_data="cinema:change_city")],
+            [IKB(text="🚫 Жанры-табу", callback_data="prof:blacklist")],
+            [IKB(text="🔥 Громкие новинки", callback_data="prof:trending")],
+        ]
+        markup = IKM(inline_keyboard=rows_kb)
+
+        if edit and isinstance(message_or_call, CallbackQuery):
+            try:
+                await message_or_call.message.edit_text(
+                    "\n".join(lines), parse_mode="HTML", reply_markup=markup,
+                )
+                return
+            except Exception:
+                pass
+        await bot_obj.send_message(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=markup)
+
+    @router.message(Command("profile"))
+    async def cmd_profile(message: Message) -> None:
+        await _render_profile(message)
+
+    @router.callback_query(F.data == "prof:rating")
+    async def cb_profile_rating(call: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(MinRatingFSM.waiting)
+        await call.answer()
+        await call.message.answer(
+            "⭐ Введи минимальный рейтинг КП для подбора (от 0.0 до 10.0).\n"
+            "Например <code>7.5</code>. /cancel — отмена",
+            parse_mode="HTML",
+        )
+
+    @router.message(MinRatingFSM.waiting, Command("cancel"))
+    async def min_rating_cancel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer("Отменил.")
+
+    @router.message(MinRatingFSM.waiting)
+    async def min_rating_typed(message: Message, state: FSMContext) -> None:
+        text = (message.text or "").strip().replace(",", ".")
+        try:
+            val = float(text)
+        except Exception:
+            await message.answer("Нужно число, например <code>7.5</code>", parse_mode="HTML")
+            return
+        if val < 0 or val > 10:
+            await message.answer("Рейтинг 0.0–10.0, попробуй ещё.")
+            return
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            user.min_rating = val
+            await session.commit()
+        await state.clear()
+        await message.answer(f"⭐ Минимальный рейтинг: <b>{val:.1f}</b>", parse_mode="HTML")
+        await _render_profile(message)
+
+    @router.callback_query(F.data == "prof:blacklist")
+    async def cb_profile_bl(call: CallbackQuery) -> None:
+        await call.answer()
+        await _render_blacklist(call)
+
+    @router.callback_query(F.data == "prof:trending")
+    async def cb_profile_trending(call: CallbackQuery) -> None:
+        await call.answer()
+        await cmd_trending(call.message)
+
+    # ============== /trending — громкие новинки ==============
+    @router.message(Command("trending"))
+    async def cmd_trending(message: Message) -> None:
+        loader = await start_loading(message.bot, message.chat.id)
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            min_rating = user.min_rating if user.min_rating is not None else 7.0
+            my_rows = await repo.list_user_series(session, user.id, status=None)
+            known = {s.kp_id for _, s in my_rows}
+
+        try:
+            hits = await kp.get_trending(min_rating=min_rating, days_back=60, limit=20)
+        except Exception as e:
+            await stop_loading(message.bot, message.chat.id, loader)
+            await message.answer(f"😕 KP заглох: {e}")
+            return
+        fresh = [h for h in hits if h.kp_id not in known][:10]
+        await stop_loading(message.bot, message.chat.id, loader)
+        if not fresh:
+            await message.answer(
+                f"🔥 Новинок с рейтингом ≥ {min_rating:.1f} не нашлось. "
+                f"Можешь снизить порог в /profile.",
+            )
+            return
+
+        media = [InputMediaPhoto(media=h.poster_url) for h in fresh[:10] if h.poster_url]
+        if len(media) >= 2:
+            try:
+                await message.bot.send_media_group(message.chat.id, media[:10])
+            except Exception:
+                pass
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        lines = [f"🔥 <b>Громкие новинки</b> (рейтинг ≥ {min_rating:.1f}):", ""]
+        rows_kb: list[list] = []
+        cur: list = []
+        for i, h in enumerate(fresh, 1):
+            year_str = f" ({h.year})" if h.year else ""
+            rating_str = f" ⭐{h.rating_kp:.1f}" if h.rating_kp else ""
+            marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
+            lines.append(f"{marker} <b>{h.title_ru}</b>{year_str}{rating_str}")
+            short = h.title_ru[:18] + "…" if len(h.title_ru) > 18 else h.title_ru
+            cur.append(IKB(text=f"➕ {i}. {short}", callback_data=f"addkp:{h.kp_id}"))
+            if len(cur) >= 2:
+                rows_kb.append(cur)
+                cur = []
+        if cur:
+            rows_kb.append(cur)
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=rows_kb),
+            disable_web_page_preview=True,
+        )
+
     # ============== /upcoming — премьеры под жанры пары ==============
     @router.message(Command("upcoming"))
     async def cmd_upcoming(message: Message) -> None:
@@ -2105,6 +2295,14 @@ def make_router(
     async def btn_stats(message: Message) -> None:
         await cmd_stats(message)
 
+    @router.message(F.text == "👤 Профиль")
+    async def btn_profile(message: Message) -> None:
+        await cmd_profile(message)
+
+    @router.message(F.text == "🔥 Новинки")
+    async def btn_trending(message: Message) -> None:
+        await cmd_trending(message)
+
     # ============== /suggest — Groq AI рекомендации с выбором ==============
     _SUGGEST_TYPES = [
         ("any",    "🎲 Любой"),
@@ -2128,6 +2326,22 @@ def make_router(
         ("аниме",       "🇯🇵 Аниме"),
         ("документальный", "📚 Документальный"),
     ]
+    _SUGGEST_COUNTRIES = [
+        ("any",            "🎲 Любая"),
+        ("США",            "🇺🇸 США"),
+        ("Россия",         "🇷🇺 Россия"),
+        ("Корея Южная",    "🇰🇷 Корея"),
+        ("Япония",         "🇯🇵 Япония"),
+        ("Великобритания", "🇬🇧 Великобритания"),
+        ("Испания",        "🇪🇸 Испания"),
+        ("Франция",        "🇫🇷 Франция"),
+        ("Германия",       "🇩🇪 Германия"),
+        ("Италия",         "🇮🇹 Италия"),
+        ("Турция",         "🇹🇷 Турция"),
+        ("Китай",          "🇨🇳 Китай"),
+    ]
+    _COUNTRY_LABEL = dict(_SUGGEST_COUNTRIES)
+
     _SUGGEST_YEARS = [
         ("any",       "🎲 Любой год"),
         ("2024_2030", "🆕 Новинки 2024+"),
@@ -2270,6 +2484,20 @@ def make_router(
         rows.append([IKB(text="⬅️ Назад", callback_data=f"sg:back:2:{type_slug}")])
         return IKM(inline_keyboard=rows)
 
+    def _kb_step4_country(type_slug: str, genre_slug: str, year_slug: str):
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        rows: list[list] = []
+        cur: list = []
+        for slug, label in _SUGGEST_COUNTRIES:
+            cur.append(IKB(text=label, callback_data=f"sg:c:{type_slug}:{genre_slug}:{year_slug}:{slug}"))
+            if len(cur) >= 2:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+        rows.append([IKB(text="⬅️ Назад", callback_data=f"sg:back:3:{type_slug}:{genre_slug}")])
+        return IKM(inline_keyboard=rows)
+
     def _kb_step1_type():
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
         rows: list[list] = []
@@ -2343,12 +2571,30 @@ def make_router(
                 pass
             return
         await call.answer()
-        # Удаляем wizard перед результатом — он сам разбавит галерею
+        kb = _kb_step4_country(type_slug, genre_slug, year_slug)
+        text = (
+            f"✨ Подбор: <b>{_TYPE_LABEL.get(type_slug, '🎲')}</b> · "
+            f"<b>{_GENRE_LABEL.get(genre_slug, '🎲')}</b> · "
+            f"<b>{_YEAR_LABEL.get(year_slug, '🎲')}</b>\n\n"
+            "4️⃣ <b>Страна производства?</b>"
+        )
+        try:
+            await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+    @router.callback_query(F.data.startswith("sg:c:"))
+    async def cb_suggest_country(call: CallbackQuery) -> None:
+        _, _, type_slug, genre_slug, year_slug, country_slug = call.data.split(":")
+        await call.answer()
         try:
             await call.message.delete()
         except Exception:
             pass
-        await _run_suggest(call.bot, call.message.chat.id, call.from_user.id, type_slug, genre_slug, year_slug)
+        await _run_suggest(
+            call.bot, call.message.chat.id, call.from_user.id,
+            type_slug, genre_slug, year_slug, country_slug,
+        )
 
     # «⬅️ Назад» — редактирует тот же месседж в предыдущий шаг
     @router.callback_query(F.data.startswith("sg:back:"))
@@ -2377,6 +2623,19 @@ def make_router(
                 await call.message.edit_text(header, parse_mode="HTML", reply_markup=kb)
             except Exception:
                 pass
+            return
+        if target == "3" and len(parts) >= 5:
+            type_slug, genre_slug = parts[3], parts[4]
+            kb = _kb_step3_year(type_slug, genre_slug)
+            text = (
+                f"✨ Подбор: <b>{_TYPE_LABEL.get(type_slug, '🎲')}</b> · "
+                f"<b>{_GENRE_LABEL.get(genre_slug, '🎲')}</b>\n\n"
+                "3️⃣ <b>Год выпуска?</b>"
+            )
+            try:
+                await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
 
     @router.message(SuggestYearFSM.waiting, Command("cancel"))
     async def suggest_year_cancel(message: Message, state: FSMContext) -> None:
@@ -2401,12 +2660,18 @@ def make_router(
         data = await state.get_data()
         await state.clear()
         year_slug = f"{y1}_{y2}"
-        # Подмешиваем в _YEAR_LABEL чтобы заголовок result'а выглядел красиво
         _YEAR_LABEL[year_slug] = f"📅 {y1}–{y2}"
-        await _run_suggest(
-            message.bot, message.chat.id, message.from_user.id,
-            data.get("type_slug", "any"), data.get("genre_slug", "any"), year_slug,
+        # После custom year — шлём шаг 4 (страна) новым сообщением
+        type_slug = data.get("type_slug", "any")
+        genre_slug = data.get("genre_slug", "any")
+        kb = _kb_step4_country(type_slug, genre_slug, year_slug)
+        text = (
+            f"✨ Подбор: <b>{_TYPE_LABEL.get(type_slug, '🎲')}</b> · "
+            f"<b>{_GENRE_LABEL.get(genre_slug, '🎲')}</b> · "
+            f"<b>{_YEAR_LABEL[year_slug]}</b>\n\n"
+            "4️⃣ <b>Страна производства?</b>"
         )
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
     async def _delete_prev_suggest(bot: Bot, chat_id: int, tg_user_id: int) -> None:
         """Удаляет сообщения с прошлой подборкой если они помечены."""
@@ -2423,6 +2688,7 @@ def make_router(
     async def _run_suggest(
         bot: Bot, chat_id: int, tg_user_id: int,
         type_slug: str, genre_slug: str, year_slug: str = "any",
+        country_slug: str = "any",
         *, append_history: bool = True,
     ) -> None:
         if not groq:
@@ -2431,12 +2697,14 @@ def make_router(
         type_label = _TYPE_LABEL.get(type_slug, "🎲 Любой")
         genre_label = _GENRE_LABEL.get(genre_slug, "🎲 Любой жанр")
         year_label = _YEAR_LABEL.get(year_slug, "🎲 Любой год")
+        country_label = _COUNTRY_LABEL.get(country_slug, "🎲 Любая")
         year_from = year_to = None
         if year_slug != "any" and "_" in year_slug:
             try:
                 year_from, year_to = (int(p) for p in year_slug.split("_"))
             except Exception:
                 pass
+        country_arg = None if country_slug == "any" else country_slug
 
         # «Думаю» — гифка через LOADING_GIF_URLS или анимированный эмодзи
         loading_msg_id = await start_loading(bot, chat_id)
@@ -2478,6 +2746,7 @@ def make_router(
                 year_from=year_from,
                 year_to=year_to,
                 forbidden_genres=forbidden_genres or None,
+                country=country_arg,
                 count=5,
             )
         except Exception as e:
@@ -2506,6 +2775,8 @@ def make_router(
             meta_bits.append(_GENRE_LABEL[genre_slug])
         if year_from or year_to:
             meta_bits.append(year_label)
+        if country_arg:
+            meta_bits.append(country_label)
         if meta_bits:
             header_bits.append(" · " + " · ".join(meta_bits))
         # Номер batch (для понимания «дальше N+1»)
@@ -2532,6 +2803,7 @@ def make_router(
             "type": type_slug,
             "genre": genre_slug,
             "year": year_slug,
+            "country": country_slug,
             "titles": [s.title for s in suggestions],
             "message_ids": msg_ids,
         }
@@ -2559,12 +2831,12 @@ def make_router(
             await cmd_suggest(call.message)
             return
         if action == "next":
-            # Новый batch с теми же фильтрами
             current = sess["batches"][sess["cursor"]]
             await call.answer("🔄 Подбираю ещё…")
             await _run_suggest(
                 call.bot, call.message.chat.id, call.from_user.id,
                 current["type"], current["genre"], current["year"],
+                current.get("country", "any"),
                 append_history=True,
             )
             return
@@ -2585,7 +2857,7 @@ def make_router(
             sess["cursor"] -= 1
             await _run_suggest(
                 call.bot, call.message.chat.id, call.from_user.id,
-                prev["type"], prev["genre"], prev["year"],
+                prev["type"], prev["genre"], prev["year"], prev.get("country", "any"),
                 append_history=True,
             )
 
@@ -2785,6 +3057,8 @@ def make_router(
         "👀 Хочу", "▶️ Смотрю",
         "✅ Посмотрел", "🔁 Пересмотреть",
         "💛 Лайки оба", "✨ Подобрать",
+        "👤 Профиль", "🔥 Новинки", "💛 Поддержать",
+        "👫 Пара",
         "📊 Статистика", "ℹ️ Помощь",
     }
 
@@ -2960,7 +3234,8 @@ def make_router(
             if isinstance(yf, int) and isinstance(yt, int):
                 year_slug = f"{yf}_{yt}"
                 _YEAR_LABEL[year_slug] = f"📅 {yf}–{yt}"
-            await _run_suggest(message.bot, message.chat.id, message.from_user.id, ct, gn, year_slug)
+            country = (intent.get("country") or "any").strip()
+            await _run_suggest(message.bot, message.chat.id, message.from_user.id, ct, gn, year_slug, country)
             return True
         if action == "chat":
             response = (intent.get("response") or "").strip()
