@@ -71,6 +71,7 @@ from ..keyboards.series_kb import (
 )
 from ..services.groq_ai import GroqClient
 from ..services.kinopoisk import KinopoiskClient, KPDetails
+from ..services.loading import start_loading, stop_loading
 from ..services.scheduler import run_weekly_checkin
 from ..services.trailer import find_trailer_tg_link
 from ..services.trailer_search import TrailerFinder, build_youtube_search_url
@@ -2276,11 +2277,8 @@ def make_router(
             except Exception:
                 pass
 
-        loading_msg = await bot.send_message(
-            chat_id,
-            f"🪄 Готовлю подбор: <b>{type_label}</b> · <b>{genre_label}</b> · <b>{year_label}</b>…",
-            parse_mode="HTML",
-        )
+        # «Думаю» — гифка через LOADING_GIF_URLS или анимированный эмодзи
+        loading_msg_id = await start_loading(bot, chat_id)
         await bot.send_chat_action(chat_id, action="typing")
 
         async with session_factory() as session:
@@ -2323,18 +2321,12 @@ def make_router(
             )
         except Exception as e:
             logger.exception("Groq suggest failed")
-            try:
-                await bot.delete_message(chat_id, loading_msg.message_id)
-            except Exception:
-                pass
+            await stop_loading(bot, chat_id, loading_msg_id)
             await bot.send_message(chat_id, f"😕 ИИ заглох: {e}")
             return
 
-        # Удаляем «готовлю…» и прошлый batch (если есть)
-        try:
-            await bot.delete_message(chat_id, loading_msg.message_id)
-        except Exception:
-            pass
+        # Удаляем «думаю…» и прошлый batch (если есть)
+        await stop_loading(bot, chat_id, loading_msg_id)
         await _delete_prev_suggest(bot, chat_id, tg_user_id)
 
         if not suggestions:
@@ -2635,23 +2627,133 @@ def make_router(
         "📊 Статистика", "ℹ️ Помощь",
     }
 
+    # Командные слова — если есть в тексте, дёргаем Groq как interpreter.
+    # Иначе считаем что это название фильма.
+    _COMMAND_HINTS = (
+        "исключ", "убер", "не предла", "не показывай", "забан", "блок",
+        "добавь в чёрн", "добавь в черн", "в чёрный", "в черный",
+        "покажи", "список", "посмотреть", "что в", "найди трейлер",
+        "трейлер для", "подбери", "подбор", "подскажи", "посоветуй",
+        "подпиш", "подписаться",
+        "верни", "сними", "разреши",
+    )
+
+    def _looks_like_command(text: str) -> bool:
+        t = text.lower()
+        return any(h in t for h in _COMMAND_HINTS)
+
     @router.message(F.text & ~F.text.startswith("/"))
     async def text_as_search(message: Message, state: FSMContext) -> None:
         current_state = await state.get_state()
         if current_state is not None:
-            # В FSM — спец-хендлеры (note, pick, swipe) сработают раньше
             return
         text = (message.text or "").strip()
         if not text or text in _BUTTON_TEXTS:
             return
         if len(text) < 2:
             return
-        # Несколько названий одним сообщением → bulk-добавление
+        # Несколько названий одним сообщением → bulk
         bulk = _parse_titles_bulk(text)
         if bulk:
             await _bulk_add_titles(message.bot, message.chat.id, message.from_user.id, bulk)
             return
+        # Текст похож на команду — спросим Groq что хотел юзер
+        if groq and _looks_like_command(text):
+            loader = await start_loading(message.bot, message.chat.id)
+            try:
+                intent = await groq.interpret_command(text)
+            finally:
+                await stop_loading(message.bot, message.chat.id, loader)
+            handled = await _handle_intent(message, intent)
+            if handled:
+                return
         await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, text, state=state)
+
+    async def _handle_intent(message: Message, intent: dict) -> bool:
+        """Возвращает True если intent обработан и поиск делать не надо."""
+        action = (intent or {}).get("action", "")
+        if action == "blacklist_add":
+            genre = (intent.get("genre") or "").strip().lower()
+            if genre not in _GENRE_LABEL:
+                await message.answer(
+                    f"🤔 Не понял жанр «{genre}». Доступные: {', '.join(g for g, _ in _SUGGEST_GENRES[1:])}\n"
+                    f"Или открой /blacklist — там список с кнопками.",
+                )
+                return True
+            async with session_factory() as session:
+                user = await repo.get_or_create_user(
+                    session, tg_id=message.from_user.id,
+                    username=message.from_user.username, full_name=message.from_user.full_name,
+                )
+                # Чтобы не toggle ↔ — добавляем только если ещё нет
+                current = set(await repo.list_blacklisted_genres(session, user))
+                if genre not in current:
+                    await repo.toggle_blacklisted_genre(session, user, genre)
+                    await session.commit()
+            await message.answer(
+                f"🚫 <b>{_GENRE_LABEL.get(genre, genre)}</b> — в чёрном списке. "
+                f"Больше не предложу.",
+                parse_mode="HTML",
+            )
+            return True
+
+        if action == "blacklist_remove":
+            genre = (intent.get("genre") or "").strip().lower()
+            async with session_factory() as session:
+                user = await repo.get_or_create_user(
+                    session, tg_id=message.from_user.id,
+                    username=message.from_user.username, full_name=message.from_user.full_name,
+                )
+                current = set(await repo.list_blacklisted_genres(session, user))
+                if genre in current:
+                    await repo.toggle_blacklisted_genre(session, user, genre)
+                    await session.commit()
+                    await message.answer(
+                        f"✅ <b>{_GENRE_LABEL.get(genre, genre)}</b> — снова разрешён.",
+                        parse_mode="HTML",
+                    )
+                else:
+                    await message.answer(f"💡 «{genre}» и так не в чёрном списке.")
+            return True
+
+        if action == "show_blacklist":
+            await cmd_blacklist(message)
+            return True
+        if action == "show_list":
+            await cmd_list(message)
+            return True
+        if action == "show_stats":
+            await cmd_stats(message)
+            return True
+        if action == "find_trailer":
+            title = (intent.get("title") or "").strip()
+            if title:
+                # Делаем обычный поиск — юзер потом сам нажмёт «🎥 Трейлер»
+                await message.answer(f"🔎 Найду <b>{title}</b>, потом жми «🎥 Трейлер» под карточкой.", parse_mode="HTML")
+                await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, title)
+            return True
+        if action == "suggest":
+            # Сразу запускаем _run_suggest с распознанными параметрами
+            ct = intent.get("content_type") or "any"
+            gn = (intent.get("genre") or "any").lower()
+            if gn not in _GENRE_LABEL:
+                gn = "any"
+            if ct not in _TYPE_LABEL:
+                ct = "any"
+            year_slug = "any"
+            yf, yt = intent.get("year_from"), intent.get("year_to")
+            if isinstance(yf, int) and isinstance(yt, int):
+                year_slug = f"{yf}_{yt}"
+                _YEAR_LABEL[year_slug] = f"📅 {yf}–{yt}"
+            await _run_suggest(message.bot, message.chat.id, message.from_user.id, ct, gn, year_slug)
+            return True
+        if action == "search":
+            title = (intent.get("title") or "").strip()
+            if title:
+                await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, title)
+                return True
+        # unknown — пусть отрабатывает обычный поиск
+        return False
 
 
     # ============== Inline-режим: @bot Severance в любом чате ==============

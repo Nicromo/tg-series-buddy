@@ -147,6 +147,50 @@ class GroqClient:
             logger.warning("mood_search failed: %s", e)
             return []
 
+    async def interpret_command(self, text: str) -> dict:
+        """Понять свободный текст как команду боту. Возвращает dict с action:
+        - {"action": "blacklist_add", "genre": "..."} — добавить жанр в чёрный список
+        - {"action": "blacklist_remove", "genre": "..."} — убрать жанр из ч.с.
+        - {"action": "show_blacklist"} — показать чёрный список
+        - {"action": "suggest", "content_type": "series|movie", "genre": "...", "year_from": int, "year_to": int} — запустить подбор
+        - {"action": "show_list"} — показать /list
+        - {"action": "show_match"} — общие лайки
+        - {"action": "show_stats"} — статистика
+        - {"action": "find_trailer", "title": "..."} — трейлер конкретного
+        - {"action": "subscribe_youtube", "url": "..."} — подписка на ютуб-канал
+        - {"action": "search", "title": "..."} — поиск сериала по названию (если ничто из выше не подошло)
+        - {"action": "unknown"} — не понял
+
+        Никогда не вызывает исключений — при ошибке возвращает {"action": "unknown"}.
+        """
+        system = (
+            "Ты — interpreter команд для бота учёта сериалов и фильмов. "
+            "Юзер пишет на русском или английском. Верни ТОЛЬКО JSON.\n"
+            "Поддерживаемые actions:\n"
+            "- blacklist_add: добавить жанр в чёрный список «никогда не предлагать». "
+            "Жанры строго из: драма, триллер, комедия, фантастика, ужасы, мелодрама, детектив, "
+            "боевик, фэнтези, приключения, криминал, мультфильм, аниме, документальный.\n"
+            "- blacklist_remove: убрать жанр из чёрного списка.\n"
+            "- show_blacklist: показать текущий чёрный список.\n"
+            "- suggest: запустить подбор (опц. поля content_type, genre, year_from, year_to).\n"
+            "- show_list / show_match / show_stats: показать соответствующий список.\n"
+            "- find_trailer: с полем title.\n"
+            "- subscribe_youtube: с полем url или handle (если в тексте есть ссылка на YouTube канал).\n"
+            "- search: ПО УМОЛЧАНИЮ для коротких названий фильмов/сериалов (1-4 слова без глаголов команды).\n"
+            "- unknown: если бессмыслица.\n\n"
+            "Глаголы команд: «исключи», «убери», «добавь в чёрный», «забань», «больше не предлагай», "
+            "«покажи», «список», «найди трейлер», «подписаться на», «подбери», «что есть в»."
+        )
+        user = f"Текст пользователя: «{text}»\nВерни JSON."
+        try:
+            raw = await self.chat(system, user, json_mode=True)
+            data = json.loads(raw)
+            if isinstance(data, dict) and "action" in data:
+                return data
+        except Exception as e:
+            logger.warning("Groq interpret_command failed: %s", e)
+        return {"action": "unknown"}
+
     async def similar_to(
         self,
         *,
