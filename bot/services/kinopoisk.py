@@ -55,6 +55,10 @@ class KPDetails:
     # Где смотреть: [(имя сервиса, url)]
     watch_options: list[tuple] = field(default_factory=list)
 
+    # External IDs — нужны для поиска трейлеров в TMDB и др.
+    imdb_id: Optional[str] = None  # формат "tt1234567"
+    tmdb_id: Optional[int] = None
+
     @property
     def best_trailer_youtube_id(self) -> Optional[str]:
         """Извлекаем YouTube-id из первой подходящей ссылки."""
@@ -235,6 +239,11 @@ class KinopoiskClient:
             best_name = trailers_sorted[0].get("name") or ""
             best_trailer_language = "ru" if _trailer_is_russian(best_name) else "en"
 
+        ext = d.get("externalId") or {}
+        imdb_id = (ext.get("imdb") or "").strip() or None
+        tmdb_id_raw = ext.get("tmdb")
+        tmdb_id = int(tmdb_id_raw) if tmdb_id_raw else None
+
         watch_options_raw = ((d.get("watchability") or {}).get("items") or [])
         watch_options = []
         for w in watch_options_raw[:6]:
@@ -259,4 +268,6 @@ class KinopoiskClient:
             trailers=trailers,
             best_trailer_language=best_trailer_language,
             watch_options=watch_options,
+            imdb_id=imdb_id,
+            tmdb_id=tmdb_id,
         )

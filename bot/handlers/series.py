@@ -38,6 +38,7 @@ from ..services.groq_ai import GroqClient
 from ..services.kinopoisk import KinopoiskClient, KPDetails
 from ..services.scheduler import run_weekly_checkin
 from ..services.trailer import find_trailer_tg_link
+from ..services.trailer_search import TrailerFinder, build_youtube_search_url
 from ._series_helpers import (
     DIGIT_EMOJI,
     NoteFSM,
@@ -62,6 +63,7 @@ def make_router(
     groq: Optional[GroqClient] = None,
 ) -> Router:
     router = Router(name="series")
+    trailer_finder = TrailerFinder()  # читает TMDB_API_KEY/YOUTUBE_API_KEY из env
 
     # ============== /add and КNopкa "🎬 Добавить" ==============
     @router.message(Command("add"))
@@ -421,6 +423,20 @@ def make_router(
             await call.answer("❌ Дропнул")
 
     # ============== Трейлер ==============
+    async def _send_trailer_message(chat_id: int, bot: Bot, title: str, youtube_url: str, *, only_english: bool) -> None:
+        """Шлёт сообщение с YouTube URL и кнопкой «Открыть в YouTube»."""
+        lines = [f"🎥 Трейлер · <b>{title}</b>"]
+        if only_english:
+            lines.append("🇬🇧 Только английский трейлер")
+        lines.append(youtube_url)
+        await bot.send_message(
+            chat_id,
+            "\n".join(lines),
+            parse_mode="HTML",
+            disable_web_page_preview=False,
+            reply_markup=trailer_link_keyboard(youtube_url),
+        )
+
     @router.callback_query(F.data.startswith("tr:"))
     async def cb_trailer(call: CallbackQuery) -> None:
         series_id = int(call.data.split(":")[1])
@@ -448,23 +464,59 @@ def make_router(
             title = series.title_ru
             year = series.year
             trailer_lang = series.trailer_language
+            kp_id = series.kp_id
 
-        # Основной путь: YouTube URL — Telegram сам отрисует preview с тумбнейлом
+        # 1) Кешированный yt_id — мгновенно
         if yt_id:
-            youtube_url = f"https://www.youtube.com/watch?v={yt_id}"
-            lines = [f"🎥 Трейлер · <b>{title}</b>"]
-            if trailer_lang and trailer_lang != "ru":
-                lines.append("🇬🇧 Только английский трейлер")
-            lines.append(youtube_url)
-            await call.message.answer(
-                "\n".join(lines),
-                parse_mode="HTML",
-                disable_web_page_preview=False,
-                reply_markup=trailer_link_keyboard(youtube_url),
+            url = f"https://www.youtube.com/watch?v={yt_id}"
+            await _send_trailer_message(
+                call.message.chat.id, call.bot, title, url,
+                only_english=(trailer_lang and trailer_lang != "ru"),
             )
             return
 
-        # Фолбэк: ссылка на пост в TG-канале
+        # 2) Ничего нет в БД — поищем через все источники
+        await call.bot.send_chat_action(call.message.chat.id, action="typing")
+        imdb_id = tmdb_id = None
+        is_series_flag = True
+        try:
+            details = await kp.get_details(kp_id)
+            imdb_id = details.imdb_id
+            tmdb_id = details.tmdb_id
+            is_series_flag = details.is_series
+            # KP мог обновить trailers с момента upsert'а — сразу проверим
+            if details.best_trailer_youtube_id:
+                yt_id = details.best_trailer_youtube_id
+                trailer_lang = details.best_trailer_language
+        except Exception as e:
+            logger.warning("kp.get_details for trailer search failed: %s", e)
+
+        if not yt_id:
+            try:
+                yt_id = await trailer_finder.find(
+                    title=title, year=year, imdb_id=imdb_id, tmdb_id=tmdb_id,
+                    is_series=is_series_flag,
+                )
+            except Exception as e:
+                logger.exception("trailer_finder failed: %s", e)
+
+        if yt_id:
+            # Кешируем для повторных кликов
+            async with session_factory() as session:
+                s = await session.get(Series, series_id)
+                if s:
+                    s.trailer_youtube_id = yt_id
+                    if trailer_lang:
+                        s.trailer_language = trailer_lang
+                    await session.commit()
+            url = f"https://www.youtube.com/watch?v={yt_id}"
+            await _send_trailer_message(
+                call.message.chat.id, call.bot, title, url,
+                only_english=(trailer_lang and trailer_lang != "ru"),
+            )
+            return
+
+        # 3) TG-канал
         tg_link = await find_trailer_tg_link(title, year)
         if tg_link:
             await call.message.answer(
@@ -472,7 +524,14 @@ def make_router(
                 disable_web_page_preview=False,
             )
             return
-        await call.message.answer("😕 Не получилось найти трейлер.")
+
+        # 4) Финальный fallback — страница поиска YouTube (всегда что-то покажет)
+        search_url = build_youtube_search_url(title, year)
+        await call.message.answer(
+            f"🎥 Точного трейлера не нашёл. Глянь в поиске YouTube:\n{search_url}",
+            disable_web_page_preview=False,
+            reply_markup=trailer_link_keyboard(search_url),
+        )
 
     # ============== Кнопки из /suggest: addkp: и trkp: ==============
     @router.callback_query(F.data.startswith("addkp:"))
@@ -487,35 +546,54 @@ def make_router(
     async def cb_trailer_kp(call: CallbackQuery) -> None:
         kp_id = int(call.data.split(":")[1])
         await call.answer()
+        await call.bot.send_chat_action(call.message.chat.id, action="typing")
         try:
             details = await kp.get_details(kp_id)
         except Exception as e:
             logger.exception("KP details failed for trkp")
             await call.message.answer(f"😕 Не получилось загрузить: {e}")
             return
+
+        title = details.title_ru
+        year = details.year
+        trailer_lang = details.best_trailer_language
         yt_id = details.best_trailer_youtube_id
+
+        # Если KP не дал — пробуем все источники
+        if not yt_id:
+            try:
+                yt_id = await trailer_finder.find(
+                    title=title, year=year,
+                    imdb_id=details.imdb_id, tmdb_id=details.tmdb_id,
+                    is_series=details.is_series,
+                )
+            except Exception as e:
+                logger.warning("trailer_finder failed in trkp: %s", e)
+
         if yt_id:
             url = f"https://www.youtube.com/watch?v={yt_id}"
-            lines = [f"🎥 Трейлер · <b>{details.title_ru}</b>"]
-            if details.best_trailer_language and details.best_trailer_language != "ru":
-                lines.append("🇬🇧 Только английский трейлер")
-            lines.append(url)
-            await call.message.answer(
-                "\n".join(lines),
-                parse_mode="HTML",
-                disable_web_page_preview=False,
-                reply_markup=trailer_link_keyboard(url),
+            await _send_trailer_message(
+                call.message.chat.id, call.bot, title, url,
+                only_english=(trailer_lang and trailer_lang != "ru"),
             )
             return
-        # Фолбэк на TG-канал
-        tg_link = await find_trailer_tg_link(details.title_ru, details.year)
+
+        # TG-канал
+        tg_link = await find_trailer_tg_link(title, year)
         if tg_link:
             await call.message.answer(
                 f"🎥 Нашёл трейлер в TG-канале: {tg_link}",
                 disable_web_page_preview=False,
             )
             return
-        await call.message.answer(f"😕 Трейлер для «{details.title_ru}» не нашёл.")
+
+        # Финальный fallback — YouTube search page
+        search_url = build_youtube_search_url(title, year)
+        await call.message.answer(
+            f"🎥 Точного трейлера не нашёл. Глянь в поиске YouTube:\n{search_url}",
+            disable_web_page_preview=False,
+            reply_markup=trailer_link_keyboard(search_url),
+        )
 
     # ============== Заметки (note:) — FSM ==============
     @router.callback_query(F.data.startswith("note:"))
