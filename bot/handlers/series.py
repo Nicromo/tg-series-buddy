@@ -2339,21 +2339,28 @@ def make_router(
         ("аниме",       "🇯🇵 Аниме"),
         ("документальный", "📚 Документальный"),
     ]
+    # ASCII slugs! Cyrillic в callback_data → BUTTON_DATA_INVALID (>64 байта)
     _SUGGEST_COUNTRIES = [
-        ("any",            "🎲 Любая"),
-        ("США",            "🇺🇸 США"),
-        ("Россия",         "🇷🇺 Россия"),
-        ("Корея Южная",    "🇰🇷 Корея"),
-        ("Япония",         "🇯🇵 Япония"),
-        ("Великобритания", "🇬🇧 Великобритания"),
-        ("Испания",        "🇪🇸 Испания"),
-        ("Франция",        "🇫🇷 Франция"),
-        ("Германия",       "🇩🇪 Германия"),
-        ("Италия",         "🇮🇹 Италия"),
-        ("Турция",         "🇹🇷 Турция"),
-        ("Китай",          "🇨🇳 Китай"),
+        ("any", "🎲 Любая"),
+        ("us",  "🇺🇸 США"),
+        ("ru",  "🇷🇺 Россия"),
+        ("kr",  "🇰🇷 Корея"),
+        ("jp",  "🇯🇵 Япония"),
+        ("gb",  "🇬🇧 Великобритания"),
+        ("es",  "🇪🇸 Испания"),
+        ("fr",  "🇫🇷 Франция"),
+        ("de",  "🇩🇪 Германия"),
+        ("it",  "🇮🇹 Италия"),
+        ("tr",  "🇹🇷 Турция"),
+        ("cn",  "🇨🇳 Китай"),
     ]
     _COUNTRY_LABEL = dict(_SUGGEST_COUNTRIES)
+    # slug → имя страны для KP API (Кинопоиск ждёт русское название)
+    _COUNTRY_SLUG_TO_KP = {
+        "us": "США", "ru": "Россия", "kr": "Корея Южная", "jp": "Япония",
+        "gb": "Великобритания", "es": "Испания", "fr": "Франция",
+        "de": "Германия", "it": "Италия", "tr": "Турция", "cn": "Китай",
+    }
 
     _SUGGEST_YEARS = [
         ("any",       "🎲 Любой год"),
@@ -2717,7 +2724,11 @@ def make_router(
                 year_from, year_to = (int(p) for p in year_slug.split("_"))
             except Exception:
                 pass
-        country_arg = None if country_slug == "any" else country_slug
+        # slug (us/ru/...) → имя для KP API; back-compat: если пришло уже имя
+        country_arg = (
+            None if country_slug == "any"
+            else _COUNTRY_SLUG_TO_KP.get(country_slug, country_slug)
+        )
 
         # «Думаю» — тематический плейсхолдер
         loading_msg_id = await start_loading(bot, chat_id, context="suggest")
