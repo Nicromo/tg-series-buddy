@@ -5,8 +5,44 @@ from __future__ import annotations
 import io
 import logging
 import random
+import re
 from collections import Counter
 from typing import Optional
+
+
+def _parse_titles_bulk(text: str) -> list[str]:
+    """Разбивает массивный ввод на список названий.
+
+    Поддерживает:
+    - Каждое название с новой строки (с/без номеров «1.», «- », «• »)
+    - Через запятую или точку с запятой
+    - Смешанно
+
+    Возвращает [] если ввод выглядит как одно название (без явных
+    разделителей или с короткими частями).
+    """
+    # 1) По переводам строки — самый надёжный признак списка
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) >= 2:
+        cleaned: list[str] = []
+        for l in lines:
+            # «1. X», «1) X», «2: X» → X
+            l = re.sub(r"^\d+\s*[\.\)\:]\s*", "", l)
+            # «- X», «• X», «* X», «– X»
+            l = re.sub(r"^[\-•*–]\s*", "", l)
+            l = l.strip()
+            if len(l) >= 2:
+                cleaned.append(l)
+        if len(cleaned) >= 2:
+            return cleaned
+
+    # 2) Через запятую / точку с запятой — только если все части осмысленные
+    parts = re.split(r"[,;]+", text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) >= 2 and all(len(p) >= 3 for p in parts):
+        return parts
+
+    return []
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
@@ -72,11 +108,18 @@ def make_router(
             await message.answer(
                 "📝 Напиши название сериала после команды:\n"
                 "<code>/add Severance</code>\n\n"
-                "Или просто пришли скрин/постер — распознаю 📸",
+                "Можно сразу несколько — каждое с новой строки или через запятую.\n"
+                "Или пришли скрин/постер — распознаю 📸",
                 parse_mode="HTML",
             )
             return
-        await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, parts[1].strip(), state=state)
+        query = parts[1].strip()
+        # Несколько названий через \n или запятую → bulk
+        bulk = _parse_titles_bulk(query)
+        if bulk:
+            await _bulk_add_titles(message.bot, message.chat.id, message.from_user.id, bulk)
+            return
+        await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, query, state=state)
 
     @router.message(F.text == "🎬 Добавить")
     async def btn_add(message: Message) -> None:
@@ -142,6 +185,58 @@ def make_router(
 
         await message.answer(f"🔎 Распознал: <b>{title}</b>\nИщу в Кинопоиске…", parse_mode="HTML")
         await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, title, state=state)
+
+    async def _bulk_add_titles(bot: Bot, chat_id: int, tg_user_id: int, titles: list[str]) -> None:
+        """Массовое добавление списка названий. Шлёт один сводный отчёт."""
+        await bot.send_message(
+            chat_id,
+            f"📚 Обрабатываю <b>{len(titles)}</b> названий…",
+            parse_mode="HTML",
+        )
+        await bot.send_chat_action(chat_id, action="typing")
+
+        added: list[str] = []
+        already: list[str] = []
+        not_found: list[str] = []
+
+        for title in titles[:20]:  # cap = 20, чтобы не повесить бота
+            try:
+                hits = await kp.search(title, limit=1)
+            except Exception as e:
+                logger.warning("bulk: kp.search failed for %r: %s", title, e)
+                not_found.append(title)
+                continue
+            if not hits:
+                not_found.append(title)
+                continue
+            series, was_new = await _add_by_kp_id(
+                bot, chat_id, tg_user_id, hits[0].kp_id, session_factory, kp, silent=True,
+            )
+            if series is None:
+                not_found.append(title)
+            elif was_new:
+                added.append(series.title_ru)
+            else:
+                already.append(series.title_ru)
+
+        # Сводный отчёт
+        parts: list[str] = []
+        if added:
+            lst = "\n".join(f"  • {t}" for t in added)
+            parts.append(f"✅ <b>Добавил в «👀 Хочу» ({len(added)}):</b>\n{lst}")
+        if already:
+            lst = "\n".join(f"  • {t}" for t in already)
+            parts.append(f"💡 <b>Уже было ({len(already)}):</b>\n{lst}")
+        if not_found:
+            lst = "\n".join(f"  • {t}" for t in not_found)
+            parts.append(f"🤷 <b>Не нашёл ({len(not_found)}):</b>\n{lst}")
+        if len(titles) > 20:
+            parts.append(f"<i>… остальные {len(titles) - 20} не обработаны, повтори запрос частями.</i>")
+
+        await bot.send_message(
+            chat_id, "\n\n".join(parts) or "Ничего не добавил 🤷",
+            parse_mode="HTML",
+        )
 
     async def _do_search_and_show(bot: Bot, chat_id: int, tg_user_id: int, query: str, *, state: Optional[FSMContext] = None) -> None:
         await bot.send_chat_action(chat_id, action="typing")
@@ -1165,6 +1260,11 @@ def make_router(
         if not text or text in _BUTTON_TEXTS:
             return
         if len(text) < 2:
+            return
+        # Несколько названий одним сообщением → bulk-добавление
+        bulk = _parse_titles_bulk(text)
+        if bulk:
+            await _bulk_add_titles(message.bot, message.chat.id, message.from_user.id, bulk)
             return
         await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, text, state=state)
 

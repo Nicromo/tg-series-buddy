@@ -194,15 +194,22 @@ async def add_by_kp_id(
     kp_id: int,
     session_factory: async_sessionmaker,
     kp: KinopoiskClient,
-) -> None:
+    *,
+    silent: bool = False,
+) -> tuple[Optional[Series], bool]:
     """Достать детали из KP, сохранить в БД, привязать к юзеру (want),
-    зеркальнуть партнёру в паре. В конце — карточка."""
+    зеркальнуть партнёру в паре.
+
+    Возвращает (Series, was_newly_added) — was_newly_added=False если
+    у юзера уже был UserSeries на этот сериал (в любом статусе).
+    silent=True — не шлёт сообщения и карточку (для bulk-add)."""
     try:
         details = await kp.get_details(kp_id)
     except Exception as e:
         logger.exception("KP details failed")
-        await bot.send_message(chat_id, f"😕 Не получилось загрузить детали: {e}")
-        return
+        if not silent:
+            await bot.send_message(chat_id, f"😕 Не получилось загрузить детали: {e}")
+        return None, False
     mirrored_to_partner = False
     async with session_factory() as session:
         user = await repo.get_or_create_user(session, tg_id=tg_user_id, username=None, full_name=None)
@@ -227,6 +234,9 @@ async def add_by_kp_id(
         status = us.status if us else None
         rating = us.rating if us else None
         note = us.notes if us else None
+
+    if silent:
+        return series, not was_existing
 
     if was_existing:
         # Контекстная подсказка: какую кнопку жать в зависимости от текущего статуса
@@ -257,6 +267,7 @@ async def add_by_kp_id(
         user_status=status, user_rating=rating, note=note,
         notify_releases=notify,
     )
+    return series, not was_existing
 
 
 async def send_suggestions_gallery(
