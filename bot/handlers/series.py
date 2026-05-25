@@ -567,7 +567,7 @@ def make_router(
             kp_id = series.kp_id
             title = series.title_ru
         await call.answer("Загружаю расписание…")
-        loader = await start_loading(call.bot, call.message.chat.id)
+        loader = await start_loading(call.bot, call.message.chat.id, context="seasons")
         try:
             details = await kp.get_details(kp_id)
             if not details.is_series:
@@ -968,7 +968,7 @@ def make_router(
             return
 
         # 2) Ничего нет в БД — поищем через все источники
-        loader = await start_loading(call.bot, call.message.chat.id)
+        loader = await start_loading(call.bot, call.message.chat.id, context="trailer")
         await call.bot.send_chat_action(call.message.chat.id, action="typing")
         imdb_id = tmdb_id = None
         is_series_flag = True
@@ -1434,7 +1434,7 @@ def make_router(
     # ============== /wallpaper — постер «наша неделя» ==============
     @router.message(Command("wallpaper"))
     async def cmd_wallpaper(message: Message) -> None:
-        loader = await start_loading(message.bot, message.chat.id)
+        loader = await start_loading(message.bot, message.chat.id, context="wallpaper")
         async with session_factory() as session:
             user = await repo.get_or_create_user(
                 session, tg_id=message.from_user.id,
@@ -1744,7 +1744,7 @@ def make_router(
         return IKM(inline_keyboard=rows)
 
     async def _send_cinema_for_city(bot: Bot, chat_id: int, city_slug: str, city_name: str) -> None:
-        loader = await start_loading(bot, chat_id)
+        loader = await start_loading(bot, chat_id, context="cinema")
         try:
             hits = await kp.get_movies_in_theaters(limit=15)
         except Exception as e:
@@ -2038,7 +2038,7 @@ def make_router(
     # ============== /trending — громкие новинки ==============
     @router.message(Command("trending"))
     async def cmd_trending(message: Message) -> None:
-        loader = await start_loading(message.bot, message.chat.id)
+        loader = await start_loading(message.bot, message.chat.id, context="suggest")
         async with session_factory() as session:
             user = await repo.get_or_create_user(
                 session, tg_id=message.from_user.id,
@@ -2095,7 +2095,7 @@ def make_router(
     # ============== /upcoming — премьеры под жанры пары ==============
     @router.message(Command("upcoming"))
     async def cmd_upcoming(message: Message) -> None:
-        loader = await start_loading(message.bot, message.chat.id)
+        loader = await start_loading(message.bot, message.chat.id, context="suggest")
         async with session_factory() as session:
             user = await repo.get_or_create_user(
                 session, tg_id=message.from_user.id,
@@ -2183,7 +2183,7 @@ def make_router(
             )
             return
         genre = parts[1].strip().lower()
-        loader = await start_loading(message.bot, message.chat.id)
+        loader = await start_loading(message.bot, message.chat.id, context="suggest")
         try:
             hits = await kp.get_top_by_genre(genre, is_series=True, limit=10)
             if not hits:
@@ -2716,8 +2716,8 @@ def make_router(
                 pass
         country_arg = None if country_slug == "any" else country_slug
 
-        # «Думаю» — гифка через LOADING_GIF_URLS или анимированный эмодзи
-        loading_msg_id = await start_loading(bot, chat_id)
+        # «Думаю» — тематический плейсхолдер
+        loading_msg_id = await start_loading(bot, chat_id, context="suggest")
         await bot.send_chat_action(chat_id, action="typing")
 
         async with session_factory() as session:
@@ -2874,7 +2874,7 @@ def make_router(
     # ============== /swipe — Tinder для новых сериалов ==============
     @router.message(Command("swipe"))
     async def cmd_swipe(message: Message, state: FSMContext) -> None:
-        loader = await start_loading(message.bot, message.chat.id)
+        loader = await start_loading(message.bot, message.chat.id, context="suggest")
         async with session_factory() as session:
             user = await repo.get_or_create_user(
                 session, tg_id=message.from_user.id,
@@ -3148,7 +3148,7 @@ def make_router(
                 return
         # Текст похож на сложную команду — спрашиваем Groq
         if groq and _looks_like_command(text):
-            loader = await start_loading(message.bot, message.chat.id)
+            loader = await start_loading(message.bot, message.chat.id, context="search")
             try:
                 intent = await groq.interpret_command(text)
             finally:

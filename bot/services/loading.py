@@ -1,17 +1,18 @@
 """Анимация-плейсхолдер пока бот думает.
 
-start_loading() шлёт анимированное сообщение, возвращает message_id.
-stop_loading(message_id) удаляет его.
+start_loading(bot, chat_id, context="...") → message_id для удаления.
+stop_loading(bot, chat_id, message_id) — удаляет.
 
-Источники анимации в порядке приоритета:
-1. env LOADING_GIF_URLS — список URL через запятую (Tenor/Giphy/CDN).
-2. send_dice — нативная Telegram-анимация с эмодзи 🎲/🎯/🎰/⚽/🏀
-   (играет ~3 сек). Не требует URL, всегда работает, выглядит живо.
-3. Fallback — текстовое сообщение с эмодзи.
+Контекст ('suggest', 'trailer', 'search', 'cinema', 'seasons',
+'subscribe', 'wallpaper', None) подбирает **тематический эмодзи**
+и фразу. Используем обычное `send_message` — Telegram анимирует
+одиночный большой эмодзи + удаляется мгновенно.
 
-Поведение по умолчанию: если LOADING_GIF_URLS не задан, используем
-send_dice (живая анимация). Если хочешь отключить и оставить только
-текст: LOADING_DICE=false в env.
+ПОЧЕМУ НЕ send_dice: dice/боулинг/кубик не относятся к контексту
+бота, плюс Telegram не даёт удалять dice пока он играет (3 сек) —
+анимация «висит» на экране.
+
+GIF через env LOADING_GIF_URLS — приоритет если задан.
 """
 
 from __future__ import annotations
@@ -31,26 +32,50 @@ def _load_urls() -> list[str]:
     return [u.strip() for u in raw.split(",") if u.strip()]
 
 
-_PHRASES = [
-    "🍿 Думаю что предложить…",
-    "🎬 Подбираю что-то стоящее…",
-    "🛋 Раздвигаю диван и копаюсь в идеях…",
-    "📺 Включаю интуицию…",
-    "🪄 Колдую над списком…",
-    "🎥 Перебираю варианты…",
-    "🔮 Заглядываю в кинохрустальный шар…",
-]
+# Тематические наборы фраз — каждой длинной операции свой эмодзи и текст
+_PHRASES_BY_CONTEXT: dict[str, list[str]] = {
+    "suggest": [
+        "🎬 Думаю что предложить…",
+        "🍿 Подбираю что-то стоящее…",
+        "🪄 Колдую над подборкой…",
+        "🛋 Раздвигаю диван и роюсь в идеях…",
+        "🔮 Заглядываю в кинохрустальный шар…",
+    ],
+    "trailer": [
+        "🎥 Ищу трейлер…",
+        "🎞 Перебираю источники…",
+        "🍿 Разворачиваю плёнку…",
+    ],
+    "search": [
+        "🔎 Ищу в базе…",
+        "📚 Перебираю архив Кинопоиска…",
+    ],
+    "cinema": [
+        "🎫 Заглядываю в кассу…",
+        "📅 Смотрю расписание сеансов…",
+    ],
+    "seasons": [
+        "📺 Считаю эпизоды…",
+        "🎞 Открываю расписание сезонов…",
+    ],
+    "subscribe": [
+        "📡 Подключаюсь к каналу…",
+        "🔔 Настраиваю уведомления…",
+    ],
+    "wallpaper": [
+        "🖼 Собираю постер…",
+        "🎨 Раскладываю обложки…",
+    ],
+    "default": [
+        "🎬 Думаю…",
+        "🍿 Сейчас…",
+        "🪄 Минутку…",
+    ],
+}
 
 
-_DICE_EMOJIS = ["🎲", "🎯", "🎰", "⚽", "🏀", "🎳"]
-
-
-def _dice_enabled() -> bool:
-    return os.getenv("LOADING_DICE", "true").lower() in ("1", "true", "yes")
-
-
-async def start_loading(bot: Bot, chat_id: int) -> Optional[int]:
-    """Показывает «думаю» сообщение. Возвращает message_id для удаления."""
+async def start_loading(bot: Bot, chat_id: int, *, context: str = "default") -> Optional[int]:
+    """Показывает «думаю» сообщение с тематическим эмодзи."""
     urls = _load_urls()
     if urls:
         gif = random.choice(urls)
@@ -59,16 +84,10 @@ async def start_loading(bot: Bot, chat_id: int) -> Optional[int]:
             return m.message_id
         except Exception as e:
             logger.warning("loading gif %s failed: %s", gif, e)
-    # Нативная Telegram-анимация: send_dice играет ~3 сек.
-    if _dice_enabled():
-        try:
-            m = await bot.send_dice(chat_id, emoji=random.choice(_DICE_EMOJIS))
-            return m.message_id
-        except Exception as e:
-            logger.warning("loading dice failed: %s", e)
-    # Fallback: текст с фразой
+    # Обычное сообщение — мгновенно удаляется (в отличие от dice)
+    phrases = _PHRASES_BY_CONTEXT.get(context) or _PHRASES_BY_CONTEXT["default"]
     try:
-        m = await bot.send_message(chat_id, random.choice(_PHRASES))
+        m = await bot.send_message(chat_id, random.choice(phrases))
         return m.message_id
     except Exception as e:
         logger.warning("loading message failed: %s", e)
@@ -87,17 +106,18 @@ async def stop_loading(bot: Bot, chat_id: int, message_id: Optional[int]) -> Non
 
 class with_loader:
     """Async context manager:
-        async with with_loader(bot, chat_id):
-            ...твоя долгая работа...
-    Сам создаёт и удаляет loading-сообщение."""
+        async with with_loader(bot, chat_id, context="trailer"):
+            ...долгая работа...
+    """
 
-    def __init__(self, bot: Bot, chat_id: int):
+    def __init__(self, bot: Bot, chat_id: int, *, context: str = "default"):
         self.bot = bot
         self.chat_id = chat_id
+        self.context = context
         self.msg_id: Optional[int] = None
 
     async def __aenter__(self):
-        self.msg_id = await start_loading(self.bot, self.chat_id)
+        self.msg_id = await start_loading(self.bot, self.chat_id, context=self.context)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
