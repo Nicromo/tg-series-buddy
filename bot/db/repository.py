@@ -169,6 +169,31 @@ async def get_user_series(
     return result.scalar_one_or_none()
 
 
+async def remove_user_series(
+    session: AsyncSession, user_id: int, series_id: int
+) -> bool:
+    """Полностью удаляет UserSeries (статус, рейтинг, заметка). True если
+    запись была. Сам Series в БД остаётся — он может быть привязан к партнёру."""
+    us = await get_user_series(session, user_id, series_id)
+    if us is None:
+        return False
+    await session.delete(us)
+    await session.flush()
+    return True
+
+
+async def clear_user_series_rating(
+    session: AsyncSession, user_id: int, series_id: int
+) -> bool:
+    """Отменяет лайк/дизлайк, статус и заметку оставляет."""
+    us = await get_user_series(session, user_id, series_id)
+    if us is None:
+        return False
+    us.rating = None
+    await session.flush()
+    return True
+
+
 async def mark_checkin_sent(
     session: AsyncSession, user_id: int, series_id: int
 ) -> None:

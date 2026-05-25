@@ -327,8 +327,9 @@ def make_router(
 
     @router.callback_query(F.data.startswith("rt:"))
     async def cb_rating(call: CallbackQuery) -> None:
-        _, rating, series_id_s = call.data.split(":")
+        _, new_rating, series_id_s = call.data.split(":")
         series_id = int(series_id_s)
+        cancelled = False
         async with session_factory() as session:
             await repo.get_or_create_user(
                 session,
@@ -336,11 +337,21 @@ def make_router(
                 username=call.from_user.username,
                 full_name=call.from_user.full_name,
             )
-            await repo.set_user_series_rating(session, call.from_user.id, series_id, rating)
+            current_us = await repo.get_user_series(session, call.from_user.id, series_id)
+            # Toggle: повторное нажатие той же кнопки — снимает оценку
+            if current_us and current_us.rating == new_rating:
+                await repo.clear_user_series_rating(session, call.from_user.id, series_id)
+                cancelled = True
+            else:
+                await repo.set_user_series_rating(session, call.from_user.id, series_id, new_rating)
             await session.commit()
-        await call.answer(f"Принято: {RATING_LABELS.get(rating, rating)}")
+
+        if cancelled:
+            await call.answer(f"Отменил оценку {RATING_LABELS.get(new_rating, new_rating)}")
+            return
+        await call.answer(f"Принято: {RATING_LABELS.get(new_rating, new_rating)}")
         # После лайка — предложить похожие через Groq
-        if rating == "like" and groq:
+        if new_rating == "like" and groq:
             from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
             await call.message.answer(
                 "👍 Зашло? Подобрать похожие?",
@@ -348,6 +359,25 @@ def make_router(
                     IKB(text="🎬 Похожие сериалы", callback_data=f"simto:{series_id}")
                 ]]),
             )
+
+    @router.callback_query(F.data.startswith("rm:"))
+    async def cb_remove(call: CallbackQuery) -> None:
+        series_id = int(call.data.split(":")[1])
+        async with session_factory() as session:
+            series = await session.get(Series, series_id)
+            title = series.title_ru if series else "сериал"
+            removed = await repo.remove_user_series(session, call.from_user.id, series_id)
+            await session.commit()
+        if removed:
+            await call.answer("🗑 Убрано из твоих списков", show_alert=False)
+            try:
+                # Скрыть кнопки под старой карточкой чтобы не запутать
+                await call.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await call.message.answer(f"🗑 <b>{title}</b> убран из твоих списков", parse_mode="HTML")
+        else:
+            await call.answer("Этого сериала и так не было в твоих списках")
 
     @router.callback_query(F.data.startswith("simto:"))
     async def cb_similar_to(call: CallbackQuery) -> None:
@@ -360,9 +390,19 @@ def make_router(
             if series is None:
                 await call.answer("Сериал не найден")
                 return
-            # Что уже знает юзер — не предлагать
-            all_rows = await repo.list_user_series(session, call.from_user.id, status=None)
-            already = [s.title_ru for _, s in all_rows]
+            # Не предлагать то что уже знаком ни мне, ни партнёру
+            user = await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            my_rows = await repo.list_user_series(session, user.id, status=None)
+            partner_rows: list = []
+            if user.pair_id:
+                members = await repo.get_pair_members(session, user.pair_id)
+                for m in members:
+                    if m.id != user.id:
+                        partner_rows.extend(await repo.list_user_series(session, m.id, status=None))
+            already = list({s.title_ru for _, s in my_rows} | {s.title_ru for _, s in partner_rows})
         await call.answer("Ищу похожие…")
         await call.bot.send_chat_action(call.message.chat.id, action="typing")
         try:
@@ -590,13 +630,41 @@ def make_router(
             reply_markup=trailer_link_keyboard(search_url),
         )
 
-    # ============== Кнопки из /suggest: addkp: и trkp: ==============
+    # ============== Кнопки из /suggest: addkp: / seenkp: / trkp: ==============
     @router.callback_query(F.data.startswith("addkp:"))
     async def cb_add_kp(call: CallbackQuery) -> None:
         kp_id = int(call.data.split(":")[1])
         await call.answer("Добавляю…")
         await _add_by_kp_id(
             call.bot, call.message.chat.id, call.from_user.id, kp_id, session_factory, kp,
+        )
+
+    @router.callback_query(F.data.startswith("seenkp:"))
+    async def cb_seen_kp(call: CallbackQuery) -> None:
+        """«Уже смотрел» из предложений ИИ: сохраняем сериал в БД со
+        статусом watched чтобы Groq больше его не предлагал."""
+        kp_id = int(call.data.split(":")[1])
+        await call.answer("Запомнил")
+        try:
+            details = await kp.get_details(kp_id)
+        except Exception as e:
+            logger.exception("KP details failed for seenkp")
+            await call.message.answer(f"😕 Не получилось загрузить: {e}")
+            return
+        async with session_factory() as session:
+            await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            await repo.upsert_series_from_dict(session, _details_to_series_dict(details))
+            await session.commit()
+            series = await repo.get_series_by_kp_id(session, details.kp_id)
+            await repo.set_user_series_status(session, call.from_user.id, series.id, "watched")
+            await session.commit()
+        await call.message.answer(
+            f"✅ <b>{details.title_ru}</b> отмечен как «Уже смотрел» — "
+            f"в /suggest больше не предложу.",
+            parse_mode="HTML",
         )
 
     @router.callback_query(F.data.startswith("trkp:"))
@@ -1013,7 +1081,10 @@ def make_router(
         dislikes_a = [s.title_ru for us, s in my_rows if us.rating == "dislike"]
         likes_b = [s.title_ru for us, s in partner_rows if us.rating == "like"]
         dislikes_b = [s.title_ru for us, s in partner_rows if us.rating == "dislike"]
-        queue = [s.title_ru for us, s in my_rows if us.status in ("want", "watching")]
+        # Исключаем ВСЕ известные сериалы (включая watched/dropped/want_rewatch) —
+        # «уже смотрел / уже знаком / не интересно» не должны предлагаться повторно.
+        known_titles = {s.title_ru for _, s in my_rows} | {s.title_ru for _, s in partner_rows}
+        queue = sorted(known_titles)
 
         try:
             suggestions = await groq.suggest_for_pair(

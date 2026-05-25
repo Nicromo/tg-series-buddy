@@ -10,7 +10,13 @@ def card_keyboard(
     *,
     has_trailer: bool,
     is_watched: bool = False,
+    is_in_list: bool = False,
 ) -> InlineKeyboardMarkup:
+    """Кнопки под карточкой сериала.
+
+    is_in_list — если есть UserSeries запись, показываем «🗑 Убрать» чтобы
+    можно было удалить сериал из своих списков (вернёт в «не знаком»).
+    """
     rows: list[list[InlineKeyboardButton]] = []
 
     if is_watched:
@@ -44,6 +50,12 @@ def card_keyboard(
     rows.append(
         [InlineKeyboardButton(text="🎥 Показать трейлер", callback_data=f"tr:{series_id}")]
     )
+
+    # Удалить из своих списков (только если сериал у юзера в БД)
+    if is_in_list:
+        rows.append(
+            [InlineKeyboardButton(text="🗑 Убрать из моих списков", callback_data=f"rm:{series_id}")]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

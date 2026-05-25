@@ -134,10 +134,13 @@ async def send_card(
     note: Optional[str] = None,
 ) -> None:
     caption = format_caption(series, status=user_status, rating=user_rating, note=note)
+    # «В списках» = есть хоть какая-то связь с сериалом (статус/оценка/заметка)
+    in_list = bool(user_status or user_rating or note)
     kb = card_keyboard(
         series.id,
         has_trailer=bool(series.trailer_youtube_id or series.trailer_file_id),
         is_watched=user_status == "watched",
+        is_in_list=in_list,
     )
     if series.poster_url:
         try:
@@ -316,9 +319,10 @@ async def send_suggestions_gallery(
         await bot.send_message(chat_id, caption, parse_mode="HTML")
 
     add_row = [InlineKeyboardButton(text=f"➕ {i}", callback_data=f"addkp:{hit.kp_id}") for i, (_, hit) in enumerate(items, 1)]
+    seen_row = [InlineKeyboardButton(text=f"✅ {i}", callback_data=f"seenkp:{hit.kp_id}") for i, (_, hit) in enumerate(items, 1)]
     trailer_row = [InlineKeyboardButton(text=f"🎬 {i}", callback_data=f"trkp:{hit.kp_id}") for i, (_, hit) in enumerate(items, 1)]
     await bot.send_message(
         chat_id,
-        "Что делаем? 👇",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[add_row, trailer_row]),
+        "➕ — добавить в «Хочу», ✅ — уже смотрел (больше не предлагать), 🎬 — трейлер",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[add_row, seen_row, trailer_row]),
     )
