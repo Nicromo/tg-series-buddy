@@ -40,8 +40,6 @@ class Settings:
     groq_model: str
     db_url: str
     is_postgres: bool
-    trailer_tmp_dir: Path
-    max_trailer_mb: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -59,9 +57,6 @@ class Settings:
         db_url = _build_db_url()
         is_pg = db_url.startswith("postgresql")
 
-        trailer_dir = Path(os.getenv("TRAILER_TMP_DIR", "./data/trailers")).resolve()
-        trailer_dir.mkdir(parents=True, exist_ok=True)
-
         return cls(
             bot_token=bot_token,
             kp_api_key=kp_api_key,
@@ -70,6 +65,4 @@ class Settings:
             groq_model=groq_model,
             db_url=db_url,
             is_postgres=is_pg,
-            trailer_tmp_dir=trailer_dir,
-            max_trailer_mb=int(os.getenv("MAX_TRAILER_MB", "48")),
         )

@@ -49,6 +49,9 @@ class KPDetails:
     # Трейлеры: список URL (часто YouTube), русские в приоритете
     trailers: list[str] = field(default_factory=list)
 
+    # Язык лучшего (первого после сортировки) трейлера: "ru" | "en" | None
+    best_trailer_language: Optional[str] = None
+
     # Где смотреть: [(имя сервиса, url)]
     watch_options: list[tuple] = field(default_factory=list)
 
@@ -62,6 +65,15 @@ class KPDetails:
             if yt_id:
                 return yt_id
         return None
+
+    @property
+    def best_trailer_url(self) -> Optional[str]:
+        """YouTube URL первого подходящего трейлера (для отправки текстом)."""
+        yt_id = self.best_trailer_youtube_id
+        if yt_id:
+            return f"https://www.youtube.com/watch?v={yt_id}"
+        # Если KP отдал не-YouTube — возвращаем первую ссылку как есть
+        return self.trailers[0] if self.trailers else None
 
 
 def _extract_youtube_id(url: str) -> Optional[str]:
@@ -208,6 +220,15 @@ class KinopoiskClient:
         trailers_sorted = sorted(trailers_raw, key=_trailer_score)
         trailers = [t["url"] for t in trailers_sorted if t.get("url")]
 
+        # Язык лучшего трейлера — по имени первого после сортировки
+        best_trailer_language: Optional[str] = None
+        if trailers_sorted:
+            best_name = (trailers_sorted[0].get("name") or "").lower()
+            if "рус" in best_name or " ru " in f" {best_name} " or best_name.startswith("ru "):
+                best_trailer_language = "ru"
+            else:
+                best_trailer_language = "en"
+
         watch_options_raw = ((d.get("watchability") or {}).get("items") or [])
         watch_options = []
         for w in watch_options_raw[:6]:
@@ -230,5 +251,6 @@ class KinopoiskClient:
             status_kp=d.get("status"),
             is_series=bool(d.get("isSeries") or ((d.get("type") or "").lower().endswith("series"))),
             trailers=trailers,
+            best_trailer_language=best_trailer_language,
             watch_options=watch_options,
         )

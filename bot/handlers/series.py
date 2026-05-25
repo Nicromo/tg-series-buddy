@@ -14,7 +14,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
-    FSInputFile,
     InlineQuery,
     InlineQueryResultArticle,
     InputMediaPhoto,
@@ -37,7 +36,7 @@ from ..keyboards.series_kb import (
 from ..services.groq_ai import GroqClient
 from ..services.kinopoisk import KinopoiskClient, KPDetails
 from ..services.scheduler import run_weekly_checkin
-from ..services.trailer import fetch_best_trailer, find_trailer_tg_link
+from ..services.trailer import find_trailer_tg_link
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +172,7 @@ def _details_to_series_dict(d: KPDetails) -> dict:
         "seasons": d.seasons,
         "status_kp": d.status_kp,
         "trailer_youtube_id": d.best_trailer_youtube_id,
-        "trailer_language": "ru" if d.trailers else None,
+        "trailer_language": d.best_trailer_language,
         "watch_options_json": __import__("json").dumps(d.watch_options) if d.watch_options else None,
     }
 
@@ -506,13 +505,14 @@ def make_router(
     @router.callback_query(F.data.startswith("tr:"))
     async def cb_trailer(call: CallbackQuery) -> None:
         series_id = int(call.data.split(":")[1])
-        await call.answer("Готовлю трейлер… пара секунд")
+        await call.answer()
 
         async with session_factory() as session:
             series = await session.get(Series, series_id)
             if series is None:
                 await call.message.answer("Не нашёл сериал в БД.")
                 return
+            # Если когда-то закэшировали скачанный файл — попробуем его (мгновенно)
             if series.trailer_file_id:
                 try:
                     await call.bot.send_video(
@@ -524,53 +524,35 @@ def make_router(
                 except Exception as e:
                     logger.warning("Cached file_id failed: %s", e)
                     series.trailer_file_id = None
-                    await session.flush()
+                    await session.commit()
             yt_id = series.trailer_youtube_id
             title = series.title_ru
             year = series.year
-            tmdb_lang = series.trailer_language
+            trailer_lang = series.trailer_language
 
-        await call.bot.send_chat_action(call.message.chat.id, action="upload_video")
-        path, source = await fetch_best_trailer(
-            title_ru=title,
-            year=year,
-            youtube_id=yt_id,
-            tmdb_language=tmdb_lang,
-            out_dir=settings.trailer_tmp_dir,
-            max_mb=settings.max_trailer_mb,
-        )
-        if path is None:
-            # Fallback: ищем ссылку на пост в TG-канале — Telegram сам отрисует превью с видео
-            tg_link = await find_trailer_tg_link(title, year)
-            if tg_link:
-                await call.message.answer(
-                    f"🎥 Нашёл трейлер в TG-канале: {tg_link}",
-                    disable_web_page_preview=False,
-                )
-            else:
-                await call.message.answer("😕 Не получилось найти трейлер.")
-            return
-        try:
-            msg = await call.bot.send_video(
-                chat_id=call.message.chat.id,
-                video=FSInputFile(path),
-                caption=f"🎥 Трейлер · {title} · {source}",
-                supports_streaming=True,
+        # Основной путь: YouTube URL — Telegram сам отрисует preview с тумбнейлом
+        if yt_id:
+            youtube_url = f"https://www.youtube.com/watch?v={yt_id}"
+            lines = [f"🎥 Трейлер · <b>{title}</b>"]
+            if trailer_lang and trailer_lang != "ru":
+                lines.append("🇬🇧 Только английский трейлер")
+            lines.append(youtube_url)
+            await call.message.answer(
+                "\n".join(lines),
+                parse_mode="HTML",
+                disable_web_page_preview=False,
             )
-            if msg.video and msg.video.file_id:
-                async with session_factory() as session:
-                    series = await session.get(Series, series_id)
-                    if series:
-                        series.trailer_file_id = msg.video.file_id
-                        await session.commit()
-        except Exception as e:
-            logger.exception("send_video failed")
-            await call.message.answer(f"😕 Telegram отказался: {e}")
-        finally:
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            return
+
+        # Фолбэк: ссылка на пост в TG-канале
+        tg_link = await find_trailer_tg_link(title, year)
+        if tg_link:
+            await call.message.answer(
+                f"🎥 Нашёл трейлер в TG-канале: {tg_link}",
+                disable_web_page_preview=False,
+            )
+            return
+        await call.message.answer("😕 Не получилось найти трейлер.")
 
     # ============== Заметки (note:) — FSM ==============
     @router.callback_query(F.data.startswith("note:"))

@@ -40,7 +40,7 @@ def card_keyboard(
         ]
     )
 
-    # Кнопка трейлера ВСЕГДА -- yt-dlp найдёт через YouTube-поиск, даже если в KP нет ссылки
+    # Кнопка трейлера ВСЕГДА — если YouTube-id нет, фолбэк на TG-канал
     rows.append(
         [InlineKeyboardButton(text="🎥 Показать трейлер", callback_data=f"tr:{series_id}")]
     )
