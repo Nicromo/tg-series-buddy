@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from ..db import repository as repo
 from ..db.models import Pair, Series, YoutubeSubscription
 from ..keyboards.main_menu import main_menu
-from ..services.youtube_rss import resolve_channel, fetch_latest_videos
+from ..services.youtube_rss import resolve_channel, fetch_latest_videos, fetch_channel_title_robust
 
 
 class JoinPairFSM(StatesGroup):
@@ -355,13 +355,12 @@ def make_router(session_factory: async_sessionmaker) -> Router:
             )
             return
 
-        # Чиним сломанные title — дёргаем RSS feed (один запрос на канал)
+        # Чиним сломанные title через robust-fetch (RSS + HTML og:title)
         fixed = 0
         for s in subs:
             if _title_looks_broken(s.channel_title):
                 try:
-                    from ..services.youtube_rss import _fetch_channel_title
-                    fresh = await _fetch_channel_title(s.channel_id)
+                    fresh = await fetch_channel_title_robust(s.channel_id)
                     if fresh and not _title_looks_broken(fresh):
                         async with session_factory() as session:
                             db_s = await session.get(YoutubeSubscription, s.id)
@@ -370,8 +369,9 @@ def make_router(session_factory: async_sessionmaker) -> Router:
                                 await session.commit()
                                 s.channel_title = fresh
                                 fixed += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    import logging
+                    logging.warning("YT auto-fix title %s failed: %s", s.channel_id, e)
 
         lines = [f"📺 <b>YouTube подписки ({len(subs)}):</b>", ""]
         rows = []

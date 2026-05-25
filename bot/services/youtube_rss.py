@@ -123,27 +123,29 @@ async def _resolve_handle(handle: str) -> Optional[ChannelInfo]:
                     break
             if not ch_id:
                 return None
-            # Title — самый надёжно из RSS feed (там корректный UTF-8).
-            # На HTML-странице YouTube строки JSON могут содержать \uXXXX,
-            # которые надо парсить через json.loads — НЕ через unicode_escape
-            # (ломает кириллические байты).
-            title = await _fetch_channel_title(ch_id)
+            # Title — берём через robust-fetch (RSS + HTML с og:title).
+            # На HTML-странице JSON-строки могут содержать \uXXXX —
+            # парсим только через json.loads, никогда через unicode_escape.
+            title = await fetch_channel_title_robust(ch_id)
             if not title:
-                m = re.search(r'<meta name="title" content="([^"]+)"', html)
+                # Очень редкий случай — берём из текущей HTML страницы
+                m = re.search(r'<meta property="og:title" content="([^"]+)"', html)
                 if m:
-                    title = m.group(1)
-            if not title:
-                m = re.search(r'"channelMetadataRenderer":\{"title":"((?:[^"\\]|\\.)+)"', html)
-                if m:
-                    try:
-                        import json as _json
-                        title = _json.loads(f'"{m.group(1)}"')
-                    except Exception:
-                        title = m.group(1)
+                    import html as _html
+                    title = _html.unescape(m.group(1).strip())
             return ChannelInfo(channel_id=ch_id, title=title or handle)
     except Exception as e:
         logger.warning("YT handle resolve %s failed: %s", handle, e)
         return None
+
+
+def _looks_mojibake(s: str) -> bool:
+    """Эвристика на сломанный UTF-8 (mojibake): «Ð», «Ñ» и компания."""
+    if not s:
+        return True
+    bad_chars = "ÐÑ°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö"
+    bad = sum(1 for ch in s if ch in bad_chars)
+    return bad >= 3 and bad / max(1, len(s)) > 0.3
 
 
 async def _fetch_channel_title(channel_id: str) -> Optional[str]:
@@ -155,14 +157,70 @@ async def _fetch_channel_title(channel_id: str) -> Optional[str]:
                 params={"channel_id": channel_id},
             )
             if r.status_code != 200:
+                logger.info("YT RSS title %s status %s", channel_id, r.status_code)
                 return None
-            # Первый <title>...</title> в feed — название канала
+            # Структура: <feed><id/><channelId/><title>NAME</title>...
+            # Первый <title> — это название канала
             m = re.search(r"<title>([^<]+)</title>", r.text)
             if m:
-                return m.group(1).strip()
+                title = m.group(1).strip()
+                # RSS HTTP-headers говорят UTF-8 → httpx должен декодить правильно.
+                # Если всё-таки сломалось — пробуем restore
+                if _looks_mojibake(title):
+                    try:
+                        title = title.encode("latin-1").decode("utf-8")
+                    except Exception:
+                        pass
+                return title
     except Exception as e:
         logger.warning("YT channel title %s failed: %s", channel_id, e)
     return None
+
+
+async def fetch_channel_title_robust(channel_id: str) -> Optional[str]:
+    """Несколько источников названия канала, возвращает первый годный
+    (не None, не mojibake). Public — для использования в /subs автопочинке.
+
+    1. RSS feed (наиболее надёжно)
+    2. HTML страница канала /channel/UCxxx — meta property=og:title
+    3. То же — meta name=title
+    """
+    # 1) RSS
+    title = await _fetch_channel_title(channel_id)
+    if title and not _looks_mojibake(title):
+        return title
+
+    # 2-3) HTML страница
+    try:
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            headers={
+                "User-Agent": _UA,
+                "Cookie": _CONSENT_COOKIE,
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            },
+            follow_redirects=True,
+        ) as c:
+            r = await c.get(f"https://www.youtube.com/channel/{channel_id}")
+            if r.status_code != 200:
+                return title
+            html = r.text
+            # og:title — наиболее надёжный, отдаётся как UTF-8 строка без escape
+            for pattern in (
+                r'<meta property="og:title" content="([^"]+)"',
+                r'<meta name="title" content="([^"]+)"',
+            ):
+                m = re.search(pattern, html)
+                if m:
+                    cand = m.group(1).strip()
+                    # HTML-unescape для &amp; и т.п.
+                    import html as _html
+                    cand = _html.unescape(cand)
+                    if cand and not _looks_mojibake(cand):
+                        return cand
+    except Exception as e:
+        logger.warning("YT channel HTML title %s failed: %s", channel_id, e)
+    return title
 
 
 # ---------- Последние видео ----------
