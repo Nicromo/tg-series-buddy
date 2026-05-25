@@ -32,6 +32,10 @@ class JoinPairFSM(StatesGroup):
 class DonateAmountFSM(StatesGroup):
     waiting = State()
 
+
+class SubFSM(StatesGroup):
+    waiting_url = State()
+
 WELCOME = (
     "🛋️ <b>Диванные критики</b>\n"
     "<i>Семейный учёт сериалов для вас двоих</i>\n\n"
@@ -47,34 +51,40 @@ WELCOME = (
 
 HELP_TEXT = (
     "🛋️ <b>Диванные критики</b>\n\n"
-    "<b>📺 Сериалы (общий список с партнёром):</b>\n"
-    "/add &lt;название&gt; — найти и добавить\n"
-    "(или просто пришли скрин с постером — распознаю)\n"
-    "/list — наш общий «хочу посмотреть» (💛 — любим оба)\n"
+    "<b>📺 Сериалы и фильмы (общий с партнёром):</b>\n"
+    "/add &lt;название&gt; — найти и добавить (можно несколько через запятую/перевод строки)\n"
+    "Также — пришли постер фото 📸, голосовое 🎤 или просто напиши название\n"
+    "/list — наш общий «хочу посмотреть»\n"
     "/watching — смотрим сейчас\n"
     "/watched — досмотрели\n"
     "/rewatch — хотим пересмотреть\n"
     "/find &lt;запрос&gt; — поиск в наших сериалах\n\n"
-    "<b>✨ Подбор:</b>\n"
-    "/today — что включить сегодня\n"
+    "<b>✨ Подбор и обнаружение:</b>\n"
+    "/today — сводка + что включить сегодня\n"
     "/random — случайный из очереди\n"
-    "/suggest — 3 рекомендации от ИИ\n"
-    "/swipe — Tinder для новых сериалов\n"
+    "/suggest — подбор от ИИ (тип → жанр → год → 5 вариантов с «Дальше»)\n"
+    "/swipe — Tinder для НОВЫХ сериалов под ваши жанры\n"
     "/upcoming — премьеры на этой неделе под ваши жанры\n"
-    "/cinema — что идёт в кино в твоём городе (с сеансами)\n"
-    "/top &lt;жанр&gt; — топ-10 КП по жанру (драма, триллер, ...)\n"
-    "/poll — голосуем с партнёром «что включить»\n"
-    "/where — где смотреть из активных списков\n\n"
+    "/cinema — что в кино в твоём городе (с реальными сеансами)\n"
+    "/top &lt;жанр&gt; — топ-10 КП по жанру\n"
+    "/poll — голосуем с партнёром «что включим»\n"
+    "/where [название] — где смотреть (списком или конкретный)\n\n"
+    "<b>🚫 Фильтры ИИ:</b>\n"
+    "/blacklist — жанры которые никогда не предлагать\n"
+    "Под предложением: «✅ Уже смотрел», «❌ Не интересно» — больше не предложит\n\n"
     "<b>👫 Пара:</b>\n"
     "/pair — связаться с партнёром / показать статус пары\n\n"
     "<b>📺 YouTube подписки:</b>\n"
-    "/sub &lt;url или @handle&gt; — подписаться на канал\n"
+    "/sub [url или @handle] — подписаться на канал\n"
     "/subs — список подписок (общий с партнёром)\n\n"
     "<b>📊 Прочее:</b>\n"
     "/stats — статистика\n"
     "/checkin — спросить про активные сейчас\n"
+    "/donate — поддержать бота ⭐ Telegram Stars\n"
     "/menu — показать меню снизу\n"
-    "/help — эта справка"
+    "/help — эта справка\n\n"
+    "<i>💬 Можно просто писать боту — он понимает свободные команды.</i>\n"
+    "<i>Примеры: «исключи аниме», «трейлер Severance», «что в кино сегодня?», «посоветуй триллер 2020-х».</i>"
 )
 
 
@@ -92,8 +102,33 @@ def make_router(session_factory: async_sessionmaker) -> Router:
             )
             await session.commit()
 
-            # Deep link: /start show_<series_id> — открыть карточку конкретного сериала
+            # Deep link: /start show_<series_id> — открыть карточку
+            # /start add_<kp_id> — сразу добавить (приходит из inline @-поиска)
             arg = (command.args or "").strip() if command else ""
+            if arg.startswith("add_"):
+                try:
+                    add_kp_id = int(arg[len("add_"):])
+                except Exception:
+                    add_kp_id = 0
+                if add_kp_id:
+                    await message.answer(
+                        "👋 Добавляю сериал, который ты выбрал в поиске…",
+                        reply_markup=main_menu(),
+                    )
+                    # Используем helper из _series_helpers (через ленивый импорт)
+                    from ._series_helpers import add_by_kp_id
+                    from ..services.kinopoisk import KinopoiskClient
+                    from ..config import Settings
+                    settings = Settings.from_env()
+                    kp_client = KinopoiskClient(settings.kp_api_key, base_url=settings.kp_api_base)
+                    try:
+                        await add_by_kp_id(
+                            message.bot, message.chat.id, message.from_user.id,
+                            add_kp_id, session_factory, kp_client,
+                        )
+                    finally:
+                        await kp_client.close()
+                    return
             if arg.startswith("show_"):
                 try:
                     series_id = int(arg[len("show_"):])
@@ -288,31 +323,35 @@ def make_router(session_factory: async_sessionmaker) -> Router:
 
     # ---------- YouTube подписки ----------
 
-    @router.message(Command("sub"))
-    async def cmd_sub(message: Message) -> None:
-        parts = (message.text or "").split(maxsplit=1)
-        if len(parts) < 2:
+    async def _do_subscribe(message: Message, url_or_handle: str) -> None:
+        """Подписка с валидацией URL и человеческими ошибками."""
+        # Детект: пользователь дал URL ВИДЕО (не канала)
+        if "youtube.com/watch" in url_or_handle.lower() or "youtu.be/" in url_or_handle.lower():
             await message.answer(
-                "📺 <b>Подписка на YouTube-канал</b>\n\n"
-                "Пришли ссылку или @handle:\n"
-                "<code>/sub https://www.youtube.com/@MrBeast</code>\n"
-                "<code>/sub @kinopoisk</code>\n"
-                "<code>/sub https://www.youtube.com/channel/UCxxx</code>\n\n"
-                "Бот будет пушить новые видео.\n"
-                "Список подписок: /subs",
+                "🤔 Это ссылка на <b>видео</b>, а мне нужен <b>канал</b>.\n"
+                "Открой видео → жми на имя автора → скопируй ссылку с его страницы.\n"
+                "Или пришли @handle, например <code>@kinopoisk</code>.",
                 parse_mode="HTML",
             )
             return
-        url_or_handle = parts[1].strip()
+        if "youtube.com/shorts/" in url_or_handle.lower():
+            await message.answer(
+                "🤔 Это ссылка на Shorts, а нужна на канал. "
+                "Дай ссылку из адреса канала (с @ в URL) или его @handle.",
+            )
+            return
+
         await message.bot.send_chat_action(message.chat.id, action="typing")
         info = await resolve_channel(url_or_handle)
         if not info:
             await message.answer(
-                "❌ Не нашёл такой канал. Проверь ссылку или попробуй /sub @handle",
+                "❌ Не нашёл такой канал.\n"
+                "Принимаю: <code>@handle</code>, "
+                "<code>https://www.youtube.com/@handle</code> или "
+                "<code>https://www.youtube.com/channel/UCxxx</code>",
+                parse_mode="HTML",
             )
             return
-        # Помечаем последнее видео сразу — чтобы при подписке не получить
-        # «вышло X видео» пачкой за день назад
         latest = await fetch_latest_videos(info.channel_id, limit=1)
         last_vid_id = latest[0].video_id if latest else None
         async with session_factory() as session:
@@ -338,6 +377,33 @@ def make_router(session_factory: async_sessionmaker) -> Router:
                 f"💡 <b>{info.title}</b> уже в подписках. /subs — список.",
                 parse_mode="HTML",
             )
+
+    @router.message(Command("sub"))
+    async def cmd_sub(message: Message, state: FSMContext) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await state.set_state(SubFSM.waiting_url)
+            await message.answer(
+                "📺 <b>Подписка на YouTube-канал</b>\n\n"
+                "Пришли ссылку или @handle одним сообщением. Примеры:\n"
+                "<code>https://www.youtube.com/@MrBeast</code>\n"
+                "<code>@kinopoisk</code>\n"
+                "<code>https://www.youtube.com/channel/UCxxx</code>\n\n"
+                "/cancel — отменить",
+                parse_mode="HTML",
+            )
+            return
+        await _do_subscribe(message, parts[1].strip())
+
+    @router.message(SubFSM.waiting_url, Command("cancel"))
+    async def sub_cancel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer("Отменил.")
+
+    @router.message(SubFSM.waiting_url)
+    async def sub_url_typed(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await _do_subscribe(message, (message.text or "").strip())
 
     def _title_looks_broken(t: str) -> bool:
         """Эвристика на сломанный UTF-8: «Ð», «Ñ» подряд — это типичная

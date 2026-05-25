@@ -72,6 +72,7 @@ from ..keyboards.series_kb import (
 from ..services.groq_ai import GroqClient
 from ..services.kinopoisk import KinopoiskClient, KPDetails
 from ..services.loading import start_loading, stop_loading
+from ..services.wallpaper import build_week_wallpaper
 from ..services.scheduler import run_weekly_checkin
 from ..services.trailer import find_trailer_tg_link
 from ..services.trailer_search import TrailerFinder, build_youtube_search_url
@@ -185,8 +186,14 @@ def make_router(
             )
             return
 
-        await message.answer(f"🔎 Распознал: <b>{title}</b>\nИщу в Кинопоиске…", parse_mode="HTML")
-        await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, title, state=state)
+        await message.answer(
+            f"🔎 Распознал: <b>{title}</b>\nИщу в Кинопоиске… (подтверди что это оно — постер мог сбить)",
+            parse_mode="HTML",
+        )
+        await _do_search_and_show(
+            message.bot, message.chat.id, message.from_user.id, title,
+            state=state, force_picker=True,
+        )
 
     async def _bulk_add_titles(bot: Bot, chat_id: int, tg_user_id: int, titles: list[str]) -> None:
         """Массовое добавление списка названий. Шлёт один сводный отчёт."""
@@ -240,7 +247,11 @@ def make_router(
             parse_mode="HTML",
         )
 
-    async def _do_search_and_show(bot: Bot, chat_id: int, tg_user_id: int, query: str, *, state: Optional[FSMContext] = None) -> None:
+    async def _do_search_and_show(
+        bot: Bot, chat_id: int, tg_user_id: int, query: str, *,
+        state: Optional[FSMContext] = None,
+        force_picker: bool = False,
+    ) -> None:
         await bot.send_chat_action(chat_id, action="typing")
         try:
             hits = await kp.search(query, limit=5)
@@ -285,7 +296,7 @@ def make_router(
             await bot.send_message(chat_id, "🤷 Ничего не нашёл. Попробуй другое название (можно с годом или на оригинальном языке).")
             return
 
-        if len(hits) == 1:
+        if len(hits) == 1 and not force_picker:
             await _add_by_kp_id(bot, chat_id, tg_user_id, hits[0].kp_id, session_factory, kp)
             return
 
@@ -1416,6 +1427,39 @@ def make_router(
         # Бывает что есть только watched/dropped — тогда ничего не показываем дополнительно
         await message.answer("Активных нет. Может что-то пересмотреть? 🔁")
 
+    # ============== /wallpaper — постер «наша неделя» ==============
+    @router.message(Command("wallpaper"))
+    async def cmd_wallpaper(message: Message) -> None:
+        loader = await start_loading(message.bot, message.chat.id)
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            rows = await repo.list_user_series(session, user.id, status=None)
+        # Топ-5 активных: priority watching > want > rewatch > watched, по обновлению
+        priority = {"watching": 0, "want": 1, "want_rewatch": 2, "watched": 3}
+        active = sorted(
+            ((us, s) for us, s in rows if us.status in priority),
+            key=lambda x: (priority.get(x[0].status, 9), -(x[0].updated_at.timestamp() if x[0].updated_at else 0)),
+        )[:5]
+        status_labels = {"watching": "▶️ Смотрим", "want": "👀 Хотим", "want_rewatch": "🔁 Пересмотр", "watched": "✅ Досмотрено"}
+        items = [(status_labels.get(us.status, "🎬"), s) for us, s in active]
+
+        bot_user = await message.bot.me()
+        png = await build_week_wallpaper(items, bot_username=bot_user.username)
+        await stop_loading(message.bot, message.chat.id, loader)
+        if not png:
+            await message.answer("😕 Не получилось собрать постер. Попробуй позже.")
+            return
+        from aiogram.types import BufferedInputFile
+        await message.bot.send_photo(
+            message.chat.id,
+            photo=BufferedInputFile(png, filename="our_week.png"),
+            caption="📸 <b>Наша неделя</b> — можешь поделиться в сторис или с друзьями.",
+            parse_mode="HTML",
+        )
+
     # ============== /where — где смотреть конкретный сериал ==============
     async def _show_where_for_series(bot: Bot, chat_id: int, series: Series) -> None:
         """Показать платформы для конкретного сериала + кнопку открыть на КП."""
@@ -1520,9 +1564,19 @@ def make_router(
         await _show_where_for_series(call.bot, call.message.chat.id, series)
 
     # ============== /poll — опрос «что включим сегодня» ==============
-    # In-memory хранилище опросов. Не persistent — но опросы коротко-живущие,
-    # переживать рестарт не требуется.
+    # In-memory хранилище опросов. Не persistent. TTL 30 минут — старые
+    # опросы вычищаются при создании нового.
     _polls: dict[str, dict] = {}
+    _POLL_TTL_SEC = 30 * 60
+
+    def _cleanup_old_polls() -> None:
+        import time as _time
+        now = _time.time()
+        expired = [pid for pid, p in _polls.items() if now - p.get("created_at", 0) > _POLL_TTL_SEC]
+        for pid in expired:
+            _polls.pop(pid, None)
+        if expired:
+            logger.info("Cleaned up %d expired polls", len(expired))
 
     @router.message(Command("poll"))
     async def cmd_poll(message: Message) -> None:
@@ -1557,16 +1611,19 @@ def make_router(
             )
             return
 
+        _cleanup_old_polls()  # вычищаем протухшие опросы перед созданием нового
+
         chosen = random.sample(candidates, 3)
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
-        # Сохраняем опрос
         import secrets as _secrets
+        import time as _time
         poll_id = _secrets.token_urlsafe(6)
         _polls[poll_id] = {
             "options": [(s.id, s.title_ru, s.year) for s in chosen],
-            "votes": {},  # user_id → option_idx
+            "votes": {},
             "participants": {user.id, *partner_ids},
             "initiator_name": message.from_user.full_name or message.from_user.username or "Партнёр",
+            "created_at": _time.time(),
         }
 
         kb_rows = [
@@ -1599,9 +1656,10 @@ def make_router(
     async def cb_poll_vote(call: CallbackQuery) -> None:
         _, poll_id, opt_idx_s = call.data.split(":")
         opt_idx = int(opt_idx_s)
+        _cleanup_old_polls()
         poll = _polls.get(poll_id)
         if not poll:
-            await call.answer("Опрос уже закрыт. Создай новый: /poll", show_alert=True)
+            await call.answer("Опрос закрыт (истёк или уже завершён). Создай новый: /poll", show_alert=True)
             try:
                 await call.message.edit_reply_markup(reply_markup=None)
             except Exception:
@@ -2888,6 +2946,8 @@ def make_router(
             if h.short_description:
                 text += "\n\n" + (h.short_description[:300])
             text += f"\n\n👉 <a href=\"https://t.me/{bot_user.username}?start=show_{h.kp_id}\">Открыть в боте «Диванные критики»</a>"
+            from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+            add_url = f"https://t.me/{bot_user.username}?start=add_{h.kp_id}"
             results.append(
                 InlineQueryResultArticle(
                     id=str(h.kp_id),
@@ -2899,6 +2959,9 @@ def make_router(
                         parse_mode="HTML",
                         disable_web_page_preview=False,
                     ),
+                    reply_markup=IKM(inline_keyboard=[
+                        [IKB(text="➕ Добавить себе в список", url=add_url)],
+                    ]),
                 )
             )
         await query.answer(results, cache_time=60, is_personal=True)

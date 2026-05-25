@@ -39,6 +39,7 @@ BOT_COMMANDS = [
     BotCommand(command="blacklist", description="🚫 Жанры-табу для ИИ"),
     BotCommand(command="swipe",    description="🃏 Свайп-вечер"),
     BotCommand(command="stats",    description="📊 Статистика"),
+    BotCommand(command="wallpaper",description="📸 Постер «Наша неделя»"),
     BotCommand(command="donate",   description="💛 Поддержать бота"),
     BotCommand(command="menu",     description="✨ Главное меню"),
 ]
