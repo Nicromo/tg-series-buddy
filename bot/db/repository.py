@@ -176,22 +176,38 @@ async def upsert_series_from_dict(session: AsyncSession, data: dict) -> Series:
 
 # ---------- UserSeries ----------
 
+async def _pair_member_ids(session: AsyncSession, user_id: int) -> list[int]:
+    """Все user_id в одной паре с user_id (включая его). Если пары нет — [user_id]."""
+    user = await session.get(User, user_id)
+    if not user or not user.pair_id:
+        return [user_id]
+    members = await get_pair_members(session, user.pair_id)
+    return [m.id for m in members]
+
+
 async def set_user_series_status(
     session: AsyncSession, user_id: int, series_id: int, status: str
 ) -> UserSeries:
-    result = await session.execute(
-        select(UserSeries).where(
-            UserSeries.user_id == user_id, UserSeries.series_id == series_id
+    """Применяет статус ко ВСЕМ членам пары (или только к самому юзеру, если
+    пары нет). Возвращает UserSeries вызывающего."""
+    member_ids = await _pair_member_ids(session, user_id)
+    primary = None
+    for uid in member_ids:
+        result = await session.execute(
+            select(UserSeries).where(
+                UserSeries.user_id == uid, UserSeries.series_id == series_id
+            )
         )
-    )
-    us = result.scalar_one_or_none()
-    if us is None:
-        us = UserSeries(user_id=user_id, series_id=series_id, status=status)
-        session.add(us)
-    else:
-        us.status = status
+        us = result.scalar_one_or_none()
+        if us is None:
+            us = UserSeries(user_id=uid, series_id=series_id, status=status)
+            session.add(us)
+        else:
+            us.status = status
+        if uid == user_id:
+            primary = us
     await session.flush()
-    return us
+    return primary
 
 
 async def set_user_series_rating(
@@ -226,14 +242,18 @@ async def get_user_series(
 async def remove_user_series(
     session: AsyncSession, user_id: int, series_id: int
 ) -> bool:
-    """Полностью удаляет UserSeries (статус, рейтинг, заметка). True если
-    запись была. Сам Series в БД остаётся — он может быть привязан к партнёру."""
-    us = await get_user_series(session, user_id, series_id)
-    if us is None:
-        return False
-    await session.delete(us)
-    await session.flush()
-    return True
+    """Удаляет UserSeries у ВСЕХ членов пары — список общий. Сам Series
+    в БД остаётся (может быть отсылка из других пар)."""
+    member_ids = await _pair_member_ids(session, user_id)
+    deleted = 0
+    for uid in member_ids:
+        us = await get_user_series(session, uid, series_id)
+        if us is not None:
+            await session.delete(us)
+            deleted += 1
+    if deleted:
+        await session.flush()
+    return deleted > 0
 
 
 async def clear_user_series_rating(

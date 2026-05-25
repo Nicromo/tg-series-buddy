@@ -41,10 +41,8 @@ def card_keyboard(
 
     rows.append(
         [
-            InlineKeyboardButton(text="👍", callback_data=f"rt:like:{series_id}"),
-            InlineKeyboardButton(text="👎", callback_data=f"rt:dislike:{series_id}"),
-            InlineKeyboardButton(text="📝", callback_data=f"note:{series_id}"),
-            InlineKeyboardButton(text="📤", callback_data=f"share:{series_id}"),
+            InlineKeyboardButton(text="📝 Заметка", callback_data=f"note:{series_id}"),
+            InlineKeyboardButton(text="📤 Поделиться", callback_data=f"share:{series_id}"),
         ]
     )
 
@@ -89,17 +87,6 @@ def checkin_keyboard(series_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📝 Где остановились", callback_data=f"note:{series_id}"),
                 InlineKeyboardButton(text="❌ Дропнул", callback_data=f"ck:drop:{series_id}"),
             ],
-        ]
-    )
-
-
-def rating_only_keyboard(series_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="👍 Лайк", callback_data=f"rt:like:{series_id}"),
-                InlineKeyboardButton(text="👎 Дизлайк", callback_data=f"rt:dislike:{series_id}"),
-            ]
         ]
     )
 

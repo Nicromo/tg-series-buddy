@@ -39,11 +39,10 @@ def test_format_caption_basic():
     assert "kinopoisk.ru/film/42/" in caption
 
 
-def test_format_caption_with_status_and_rating():
+def test_format_caption_with_status():
     s = _series()
-    caption = format_caption(s, status="want", rating="like")
+    caption = format_caption(s, status="want")
     assert STATUS_LABELS["want"] in caption
-    assert "👍 Лайк" in caption
 
 
 def test_format_caption_trims_long_description():

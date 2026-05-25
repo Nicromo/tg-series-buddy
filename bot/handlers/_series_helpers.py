@@ -59,7 +59,7 @@ def format_caption(
     s: Series,
     *,
     status: Optional[str] = None,
-    rating: Optional[str] = None,
+    rating: Optional[str] = None,  # deprecated, оставлено ради бинарной совместимости
     note: Optional[str] = None,
 ) -> str:
     """Подпись под карточкой сериала. Чистая функция — для тестов."""
@@ -110,14 +110,9 @@ def format_caption(
         lines.append("")
         lines.append(desc)
 
-    pinned = []
     if status:
-        pinned.append(STATUS_LABELS.get(status, status))
-    if rating:
-        pinned.append(RATING_LABELS.get(rating, rating))
-    if pinned:
         lines.append("")
-        lines.append("• " + " • ".join(pinned))
+        lines.append("• " + STATUS_LABELS.get(status, status))
 
     if getattr(s, "watch_options_json", None):
         try:

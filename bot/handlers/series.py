@@ -29,7 +29,6 @@ from ..keyboards.series_kb import (
     bulk_move_keyboard,
     card_keyboard,
     checkin_keyboard,
-    rating_only_keyboard,
     search_results_keyboard,
     swipe_keyboard,
     trailer_link_keyboard,
@@ -310,51 +309,15 @@ def make_router(
                 username=call.from_user.username,
                 full_name=call.from_user.full_name,
             )
-            us = await repo.set_user_series_status(session, call.from_user.id, series_id, status)
+            # set_user_series_status зеркалит на всех членов пары — список общий.
+            await repo.set_user_series_status(session, call.from_user.id, series_id, status)
             await session.commit()
-
-            # Если только что отметили "досмотрел" и нет оценки — попросим
-            if status == "watched" and not us.rating:
-                series = await session.get(Series, series_id)
-                title = series.title_ru if series else "сериал"
-                await call.message.answer(
-                    f"🎯 <b>{title}</b> — досмотрено! Поставь оценку:",
-                    parse_mode="HTML",
-                    reply_markup=rating_only_keyboard(series_id),
-                )
-
         await call.answer(f"✅ {STATUS_LABELS.get(status, status)}")
-
-    @router.callback_query(F.data.startswith("rt:"))
-    async def cb_rating(call: CallbackQuery) -> None:
-        _, new_rating, series_id_s = call.data.split(":")
-        series_id = int(series_id_s)
-        cancelled = False
-        async with session_factory() as session:
-            await repo.get_or_create_user(
-                session,
-                tg_id=call.from_user.id,
-                username=call.from_user.username,
-                full_name=call.from_user.full_name,
-            )
-            current_us = await repo.get_user_series(session, call.from_user.id, series_id)
-            # Toggle: повторное нажатие той же кнопки — снимает оценку
-            if current_us and current_us.rating == new_rating:
-                await repo.clear_user_series_rating(session, call.from_user.id, series_id)
-                cancelled = True
-            else:
-                await repo.set_user_series_rating(session, call.from_user.id, series_id, new_rating)
-            await session.commit()
-
-        if cancelled:
-            await call.answer(f"Отменил оценку {RATING_LABELS.get(new_rating, new_rating)}")
-            return
-        await call.answer(f"Принято: {RATING_LABELS.get(new_rating, new_rating)}")
-        # После лайка — предложить похожие через Groq
-        if new_rating == "like" and groq:
+        # После добавления в «хочу» — предложить похожие через Groq
+        if status == "want" and groq:
             from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
             await call.message.answer(
-                "👍 Зашло? Подобрать похожие?",
+                "👀 В очереди! Подобрать похожие?",
                 reply_markup=IKM(inline_keyboard=[[
                     IKB(text="🎬 Похожие сериалы", callback_data=f"simto:{series_id}")
                 ]]),
@@ -478,16 +441,8 @@ def make_router(
                     username=call.from_user.username,
                     full_name=call.from_user.full_name,
                 )
-                us = await repo.set_user_series_status(session, call.from_user.id, series_id, "watched")
+                await repo.set_user_series_status(session, call.from_user.id, series_id, "watched")
                 await session.commit()
-                if not us.rating:
-                    series = await session.get(Series, series_id)
-                    title = series.title_ru if series else "сериал"
-                    await call.message.answer(
-                        f"🎯 <b>{title}</b> — досмотрено! Поставь оценку:",
-                        parse_mode="HTML",
-                        reply_markup=rating_only_keyboard(series_id),
-                    )
             await call.answer("✅ Досмотрел")
         elif action == "cont":
             async with session_factory() as session:
@@ -823,17 +778,6 @@ def make_router(
                 username=message.from_user.username, full_name=message.from_user.full_name,
             )
             rows = await repo.list_user_series(session, user.id, status=status)
-            # Партнёрские рейтинги — для пометки «💛 любим оба»
-            partner_ratings: dict[int, str] = {}
-            if user.pair_id:
-                members = await repo.get_pair_members(session, user.pair_id)
-                for m in members:
-                    if m.id == user.id:
-                        continue
-                    p_rows = await repo.list_user_series(session, m.id, status=None)
-                    for p_us, p_s in p_rows:
-                        if p_us.rating:
-                            partner_ratings[p_s.id] = p_us.rating
         if not rows:
             await message.answer(empty_msg)
             return
@@ -852,19 +796,11 @@ def make_router(
         # Текст: заголовок + пронумерованный список
         title = header or "Список"
         lines = [f"{title}  ·  {len(rows)} шт.", ""]
-        both_liked_count = 0
         for i, (us, s) in enumerate(items, 1):
             marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
             year_str = f" ({s.year})" if s.year else ""
             rating_str = f" ⭐{s.rating_kp:.1f}" if s.rating_kp else ""
-            # «Любим оба» если у нас обоих rating=like
-            both_liked = us.rating == "like" and partner_ratings.get(s.id) == "like"
-            liked_emoji = " 💛" if both_liked else ""
-            if both_liked:
-                both_liked_count += 1
-            lines.append(f"{marker} <b>{s.title_ru}</b>{year_str}{rating_str}{liked_emoji}")
-        if both_liked_count and status == "want":
-            lines[0] += f"  ·  💛 {both_liked_count} любим оба"
+            lines.append(f"{marker} <b>{s.title_ru}</b>{year_str}{rating_str}")
         if len(rows) > 10:
             lines.append("")
             lines.append(f"<i>… показал первые 10 из {len(rows)}. /find для поиска.</i>")
@@ -1012,25 +948,23 @@ def make_router(
             await message.answer("📊 Пока пусто. Добавь что-нибудь через /add 🎬")
             return
         st_count = Counter(us.status for us, _ in all_rows)
-        likes = sum(1 for us, _ in all_rows if us.rating == "like")
-        dislikes = sum(1 for us, _ in all_rows if us.rating == "dislike")
         genre_counter: Counter = Counter()
         for us, s in all_rows:
-            if us.rating == "like" and s.genres:
+            # «Нравящиеся» = всё что не dropped
+            if us.status != "dropped" and s.genres:
                 for g in s.genres.split(","):
                     g = g.strip()
                     if g:
                         genre_counter[g] += 1
         top_genres = ", ".join(g for g, _ in genre_counter.most_common(3)) or "—"
         text = (
-            "📊 <b>Твоя статистика</b>\n\n"
-            f"📺 Всего сериалов: <b>{len(all_rows)}</b>\n"
+            "📊 <b>Статистика</b>\n\n"
+            f"📺 Всего сериалов/фильмов: <b>{len(all_rows)}</b>\n"
             f"👀 Хочу: {st_count.get('want', 0)}\n"
             f"▶️ Смотрю: {st_count.get('watching', 0)}\n"
             f"✅ Досмотрел: {st_count.get('watched', 0)}\n"
             f"🔁 Пересмотр: {st_count.get('want_rewatch', 0)}\n"
             f"❌ Дропнул: {st_count.get('dropped', 0)}\n\n"
-            f"👍 Лайков: {likes}  ·  👎 Дизлайков: {dislikes}\n"
             f"🎭 Топ жанры: <i>{top_genres}</i>"
         )
         await message.answer(text, parse_mode="HTML")
@@ -1061,20 +995,19 @@ def make_router(
             if partner_ids:
                 partner_rows = await repo.list_user_series(session, partner_ids[0], status=None)
 
-        likes_a = [s.title_ru for us, s in my_rows if us.rating == "like"]
-        dislikes_a = [s.title_ru for us, s in my_rows if us.rating == "dislike"]
-        likes_b = [s.title_ru for us, s in partner_rows if us.rating == "like"]
-        dislikes_b = [s.title_ru for us, s in partner_rows if us.rating == "dislike"]
-        # Исключаем ВСЕ известные сериалы (включая watched/dropped/want_rewatch) —
-        # «уже смотрел / уже знаком / не интересно» не должны предлагаться повторно.
-        known_titles = {s.title_ru for _, s in my_rows} | {s.title_ru for _, s in partner_rows}
-        queue = sorted(known_titles)
+        # «Нравится» = всё что в want/watching/watched (нет деления на rating).
+        # «Не зашло» = dropped.
+        all_rows = my_rows + partner_rows
+        liked = sorted({s.title_ru for us, s in all_rows if us.status in ("want", "watching", "watched", "want_rewatch")})
+        disliked = sorted({s.title_ru for us, s in all_rows if us.status == "dropped"})
+        # Исключаем ВСЕ известные сериалы — больше не предлагать повторно.
+        known_titles = sorted({s.title_ru for _, s in all_rows})
 
         try:
             suggestions = await groq.suggest_for_pair(
-                likes_a=likes_a, likes_b=likes_b,
-                dislikes_a=dislikes_a, dislikes_b=dislikes_b,
-                already_in_queue=queue,
+                likes_a=liked, likes_b=[],
+                dislikes_a=disliked, dislikes_b=[],
+                already_in_queue=known_titles,
             )
         except Exception as e:
             logger.exception("Groq suggest failed")
@@ -1123,15 +1056,16 @@ def make_router(
         if action == "yes":
             series_id = int(series_id_s)
             async with session_factory() as session:
-                await repo.set_user_series_rating(session, call.from_user.id, series_id, "like")
+                # «Хочу» = добавить в общий want пары (set_user_series_status зеркалит)
+                await repo.set_user_series_status(session, call.from_user.id, series_id, "want")
                 await session.commit()
-            await call.answer("❤️ Лайк!")
+            await call.answer("👀 Хочу!")
         else:
             await call.answer("👎 Скип")
         next_idx = queue_idx + 1
         if next_idx >= len(queue):
             await state.clear()
-            await call.message.answer("🏁 Все варианты показал! Глянь /match — может, что-то совпало.")
+            await call.message.answer("🏁 Все варианты показал! Что отметил «хочу» — теперь в /list 👀")
             return
         await state.update_data(idx=next_idx)
         await _send_swipe_card(call.bot, call.message.chat.id, queue[next_idx][0], next_idx, session_factory)
