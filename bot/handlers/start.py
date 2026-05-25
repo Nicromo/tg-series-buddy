@@ -229,6 +229,10 @@ def make_router(session_factory: async_sessionmaker) -> Router:
         # И обновим reply-keyboard на всякий случай
         await message.answer("Меню снизу обновлено 👇", reply_markup=main_menu())
 
+    @router.message(F.text == "📂 Меню")
+    async def btn_menu(message: Message) -> None:
+        await cmd_menu(message)
+
     @router.callback_query(F.data.startswith("menugrp:"))
     async def cb_menu_group(call: CallbackQuery) -> None:
         slug = call.data.split(":", 1)[1]

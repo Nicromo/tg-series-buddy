@@ -12,11 +12,10 @@ def main_menu() -> ReplyKeyboardMarkup:
         is_persistent=True,
         input_field_placeholder="Что включаем сегодня? 🍿",
         keyboard=[
+            # Компактные 4 ряда — Профиль/Пара/Помощь/Поддержать доступны через /menu
             [KeyboardButton(text="🎬 Добавить"), KeyboardButton(text="🎲 Что включить?")],
-            [KeyboardButton(text="👀 Хочу"), KeyboardButton(text="▶️ Смотрю")],
-            [KeyboardButton(text="✅ Посмотрел"), KeyboardButton(text="🔁 Пересмотреть")],
-            [KeyboardButton(text="✨ Подобрать"), KeyboardButton(text="🔥 Новинки")],
-            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="👫 Пара")],
-            [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="💛 Поддержать")],
+            [KeyboardButton(text="👀 Хочу"), KeyboardButton(text="▶️ Смотрю"), KeyboardButton(text="✅ Посмотрел")],
+            [KeyboardButton(text="✨ Подобрать"), KeyboardButton(text="🔥 Новинки"), KeyboardButton(text="🔁 Пересмотреть")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📂 Меню"), KeyboardButton(text="ℹ️ Помощь")],
         ],
     )
