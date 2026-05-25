@@ -148,38 +148,72 @@ class GroqClient:
             return []
 
     async def interpret_command(self, text: str) -> dict:
-        """Понять свободный текст как команду боту. Возвращает dict с action:
-        - {"action": "blacklist_add", "genre": "..."} — добавить жанр в чёрный список
-        - {"action": "blacklist_remove", "genre": "..."} — убрать жанр из ч.с.
-        - {"action": "show_blacklist"} — показать чёрный список
-        - {"action": "suggest", "content_type": "series|movie", "genre": "...", "year_from": int, "year_to": int} — запустить подбор
-        - {"action": "show_list"} — показать /list
-        - {"action": "show_match"} — общие лайки
-        - {"action": "show_stats"} — статистика
-        - {"action": "find_trailer", "title": "..."} — трейлер конкретного
-        - {"action": "subscribe_youtube", "url": "..."} — подписка на ютуб-канал
-        - {"action": "search", "title": "..."} — поиск сериала по названию (если ничто из выше не подошло)
-        - {"action": "unknown"} — не понял
+        """Понять свободный текст как действие боту или вопрос про кино.
+        Возвращает dict с action:
 
-        Никогда не вызывает исключений — при ошибке возвращает {"action": "unknown"}.
+        Управление списками/фильтрами:
+        - {action: blacklist_add, genre: "..."}
+        - {action: blacklist_remove, genre: "..."}
+        - {action: show_blacklist}
+
+        Показать что-то:
+        - {action: show_list}            — мои «хочу»
+        - {action: show_watching}        — что смотрю
+        - {action: show_watched}         — досмотрено
+        - {action: show_stats}           — статистика
+        - {action: show_cinema}          — что в кино
+        - {action: show_upcoming}        — премьеры
+        - {action: show_subs}            — YouTube подписки
+
+        Действия с конкретным тайтлом:
+        - {action: find_trailer, title: "..."}
+        - {action: where_for_title, title: "..."}
+        - {action: search, title: "..."}        — добавить/найти
+
+        Подбор:
+        - {action: suggest, content_type: "series"|"movie", genre: "...", year_from: int, year_to: int}
+
+        Подписка на YouTube:
+        - {action: subscribe_youtube, url: "..."}
+
+        Свободный диалог о кино:
+        - {action: chat, response: "ответ боту другу"}  — если юзер общается, спрашивает мнение, рассуждает
+
+        - {action: unknown} — никак не связано с ботом/кино.
+
+        НИКОГДА не вызывает исключений — при ошибке {action: unknown}.
         """
         system = (
-            "Ты — interpreter команд для бота учёта сериалов и фильмов. "
-            "Юзер пишет на русском или английском. Верни ТОЛЬКО JSON.\n"
-            "Поддерживаемые actions:\n"
-            "- blacklist_add: добавить жанр в чёрный список «никогда не предлагать». "
-            "Жанры строго из: драма, триллер, комедия, фантастика, ужасы, мелодрама, детектив, "
+            "Ты — assistant для бота учёта сериалов и фильмов «Диванные критики». "
+            "Юзер пишет на русском (иногда английском). Верни ТОЛЬКО JSON с полем action.\n\n"
+            "Доступные actions:\n"
+            "• blacklist_add / blacklist_remove — управление чёрным списком жанров. "
+            "Жанры СТРОГО из: драма, триллер, комедия, фантастика, ужасы, мелодрама, детектив, "
             "боевик, фэнтези, приключения, криминал, мультфильм, аниме, документальный.\n"
-            "- blacklist_remove: убрать жанр из чёрного списка.\n"
-            "- show_blacklist: показать текущий чёрный список.\n"
-            "- suggest: запустить подбор (опц. поля content_type, genre, year_from, year_to).\n"
-            "- show_list / show_match / show_stats: показать соответствующий список.\n"
-            "- find_trailer: с полем title.\n"
-            "- subscribe_youtube: с полем url или handle (если в тексте есть ссылка на YouTube канал).\n"
-            "- search: ПО УМОЛЧАНИЮ для коротких названий фильмов/сериалов (1-4 слова без глаголов команды).\n"
-            "- unknown: если бессмыслица.\n\n"
-            "Глаголы команд: «исключи», «убери», «добавь в чёрный», «забань», «больше не предлагай», "
-            "«покажи», «список», «найди трейлер», «подписаться на», «подбери», «что есть в»."
+            "• show_blacklist — показать чёрный список.\n"
+            "• show_list — показать «хочу посмотреть».\n"
+            "• show_watching — что смотрю сейчас.\n"
+            "• show_watched — досмотренное.\n"
+            "• show_stats — статистика.\n"
+            "• show_cinema — что в кино сегодня.\n"
+            "• show_upcoming — премьеры на этой неделе/месяце.\n"
+            "• show_subs — мои YouTube подписки.\n"
+            "• find_trailer (title) — показать трейлер конкретного фильма/сериала.\n"
+            "• where_for_title (title) — где смотреть конкретный фильм/сериал.\n"
+            "• suggest (опц. content_type, genre, year_from/year_to) — подобрать через ИИ.\n"
+            "• subscribe_youtube (url) — подписаться на канал по URL.\n"
+            "• search (title) — добавить или найти фильм/сериал в КП. ДЛЯ КОРОТКИХ названий "
+            "тайтлов БЕЗ глаголов команды.\n"
+            "• chat (response) — РАЗГОВОР про кино. Если юзер спрашивает мнение, рассуждает, "
+            "задаёт общий вопрос — отвечай как друг-киноман в поле response, кратко (2-4 предложения). "
+            "В response можно упомянуть конкретные тайтлы и предложить /suggest для подбора.\n"
+            "• unknown — текст совсем не про кино/сериалы/бот.\n\n"
+            "ПРАВИЛА:\n"
+            "- Если просто название → action=search, title=название.\n"
+            "- Если просьба «найди трейлер X» → find_trailer, title=X.\n"
+            "- Если «где посмотреть X» → where_for_title.\n"
+            "- Если общий вопрос «а что есть про космос?» / «посоветуй» → action=suggest.\n"
+            "- Если рассуждение / разговор / комментарий → action=chat."
         )
         user = f"Текст пользователя: «{text}»\nВерни JSON."
         try:

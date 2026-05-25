@@ -1416,66 +1416,108 @@ def make_router(
         # Бывает что есть только watched/dropped — тогда ничего не показываем дополнительно
         await message.answer("Активных нет. Может что-то пересмотреть? 🔁")
 
-    # ============== /where — где смотреть из моих списков ==============
+    # ============== /where — где смотреть конкретный сериал ==============
+    async def _show_where_for_series(bot: Bot, chat_id: int, series: Series) -> None:
+        """Показать платформы для конкретного сериала + кнопку открыть на КП."""
+        opts: list = []
+        if series.watch_options_json:
+            try:
+                opts = json.loads(series.watch_options_json)
+            except Exception:
+                opts = []
+        lines = [f"📺 <b>Где смотреть «{series.title_ru}»:</b>", ""]
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        rows: list[list] = []
+        if opts:
+            for name, url in opts[:8]:
+                lines.append(f"• <b>{name}</b>")
+                rows.append([IKB(text=f"🎫 Открыть на {name}", url=url)])
+        else:
+            lines.append("<i>🤷 У Кинопоиска нет данных о платформах для этого тайтла.</i>")
+        # Всегда даём ссылку на страницу самого КП — там могут быть пиратские/региональные опции
+        if series.kp_id:
+            kp_url = f"https://www.kinopoisk.ru/film/{series.kp_id}/"
+            rows.append([IKB(text="🔗 Открыть на Кинопоиске", url=kp_url)])
+        await bot.send_message(
+            chat_id, "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=rows) if rows else None,
+            disable_web_page_preview=True,
+        )
+
     @router.message(Command("where"))
     async def cmd_where(message: Message) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) >= 2:
+            # «/where Severance» — ищем в твоих списках по подстроке
+            query = parts[1].strip().lower()
+            async with session_factory() as session:
+                user = await repo.get_or_create_user(
+                    session, tg_id=message.from_user.id,
+                    username=message.from_user.username, full_name=message.from_user.full_name,
+                )
+                rows = await repo.list_user_series(session, user.id, status=None)
+            matched = [
+                (us, s) for us, s in rows
+                if query in (s.title_ru or "").lower() or query in (s.title_en or "").lower()
+            ]
+            if not matched:
+                await message.answer(
+                    f"🤷 Не нашёл «{query}» в твоих списках. Добавь через /add.",
+                )
+                return
+            await _show_where_for_series(message.bot, message.chat.id, matched[0][1])
+            return
+
+        # Без аргумента — список активных с кнопками выбора
         async with session_factory() as session:
             user = await repo.get_or_create_user(
                 session, tg_id=message.from_user.id,
                 username=message.from_user.username, full_name=message.from_user.full_name,
             )
             rows = await repo.list_user_series(session, user.id, status=None)
-
-        # Группируем по платформам
-        # watch_options_json: '[["КП HD", "https://..."], ...]'
-        active = [(us, s) for us, s in rows if us.status in ("want", "watching", "want_rewatch")]
-        platforms: dict[str, list[tuple]] = {}  # platform → [(title, status, url), ...]
-        no_data: list[str] = []
-        for us, s in active:
-            if not s.watch_options_json:
-                no_data.append(s.title_ru)
-                continue
-            try:
-                opts = json.loads(s.watch_options_json)
-            except Exception:
-                no_data.append(s.title_ru)
-                continue
-            if not opts:
-                no_data.append(s.title_ru)
-                continue
-            for name, url in opts[:5]:
-                platforms.setdefault(name, []).append((s.title_ru, us.status, url))
-
-        if not platforms and not no_data:
-            await message.answer(
-                "📺 В активных списках ничего нет. Добавь через /add 🎬",
-            )
+        active = [(us, s) for us, s in rows if us.status in ("want", "watching", "want_rewatch", "watched")]
+        if not active:
+            await message.answer("📺 В списках ничего нет. Добавь через /add 🎬")
             return
 
-        # Сортируем платформы по количеству сериалов (топ-сверху)
-        sorted_platforms = sorted(platforms.items(), key=lambda x: -len(x[1]))
+        # Сортируем: watching → want → rewatch → watched
+        order = {"watching": 0, "want": 1, "want_rewatch": 2, "watched": 3}
+        active.sort(key=lambda x: (order.get(x[0].status, 9), -(x[1].rating_kp or 0)))
+        items = active[:20]
 
-        lines = [
-            f"📺 <b>Где смотреть ({len(active)} из активных):</b>",
-            "",
-        ]
-        for name, items in sorted_platforms[:8]:
-            lines.append(f"<b>{name}</b> · {len(items)} шт.")
-            for title, status, url in items[:6]:
-                status_emoji = {"want": "👀", "watching": "▶️", "want_rewatch": "🔁"}.get(status, "•")
-                lines.append(f"  {status_emoji} <a href=\"{url}\">{title}</a>")
-            if len(items) > 6:
-                lines.append(f"  <i>… и ещё {len(items) - 6}</i>")
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        lines = ["📺 <b>Где смотреть — выбери:</b>", ""]
+        btn_rows: list[list] = []
+        for i, (us, s) in enumerate(items, 1):
+            marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
+            st_emoji = {"want": "👀", "watching": "▶️", "watched": "✅", "want_rewatch": "🔁"}.get(us.status, "•")
+            year_str = f" ({s.year})" if s.year else ""
+            lines.append(f"{marker} {st_emoji} <b>{s.title_ru}</b>{year_str}")
+            btn_rows.append([IKB(text=f"📺 {i}. {s.title_ru[:25]}", callback_data=f"where:{s.id}")])
+        if len(active) > 20:
             lines.append("")
-        if no_data:
-            lines.append(f"<i>🤷 По {len(no_data)} нет инфы о платформах (KP не знает)</i>")
-        if len(sorted_platforms) > 8:
-            lines.append(f"<i>… ещё {len(sorted_platforms) - 8} платформ скрыто</i>")
+            lines.append(f"<i>… показал 20 из {len(active)}. Уточни через /where &lt;название&gt;</i>")
+        lines.append("")
+        lines.append("<i>👇 Выбери что хочешь смотреть — покажу платформы</i>")
 
-        text = "\n".join(lines)
-        if len(text) > 3900:
-            text = text[:3900] + "\n…(обрезано)"
-        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=btn_rows),
+            disable_web_page_preview=True,
+        )
+
+    @router.callback_query(F.data.startswith("where:"))
+    async def cb_where(call: CallbackQuery) -> None:
+        series_id = int(call.data.split(":")[1])
+        async with session_factory() as session:
+            series = await session.get(Series, series_id)
+            if series is None:
+                await call.answer("Не нашёл в БД")
+                return
+        await call.answer()
+        await _show_where_for_series(call.bot, call.message.chat.id, series)
 
     # ============== /poll — опрос «что включим сегодня» ==============
     # In-memory хранилище опросов. Не persistent — но опросы коротко-живущие,
@@ -2627,20 +2669,37 @@ def make_router(
         "📊 Статистика", "ℹ️ Помощь",
     }
 
-    # Командные слова — если есть в тексте, дёргаем Groq как interpreter.
-    # Иначе считаем что это название фильма.
+    # Триггеры для Groq-интерпретации. Любая фраза похожая на команду/
+    # вопрос/рассуждение — идёт в ИИ. Короткие тайтлы — через прямой поиск.
     _COMMAND_HINTS = (
+        # Управление
         "исключ", "убер", "не предла", "не показывай", "забан", "блок",
         "добавь в чёрн", "добавь в черн", "в чёрный", "в черный",
-        "покажи", "список", "посмотреть", "что в", "найди трейлер",
-        "трейлер для", "подбери", "подбор", "подскажи", "посоветуй",
-        "подпиш", "подписаться",
         "верни", "сними", "разреши",
+        # Показать
+        "покажи", "список", "посмотреть", "что в", "что есть",
+        "что мы", "что я", "афиш",
+        # Поиск
+        "найди", "трейлер", "где смотр", "где посмотр",
+        # Подбор
+        "подбери", "подбор", "подскажи", "посоветуй", "посоветуйте",
+        # YouTube
+        "подпиш", "подписаться",
+        # Вопросительные/диалоговые слова
+        "что ", "какой", "какая", "какое", "какие", "когда", "почему", "зачем",
+        "стоит ли", "годный", "норм", "хорош",
     )
 
     def _looks_like_command(text: str) -> bool:
-        t = text.lower()
-        return any(h in t for h in _COMMAND_HINTS)
+        t = text.lower().strip()
+        if "?" in t:
+            return True
+        if any(h in t for h in _COMMAND_HINTS):
+            return True
+        # Любая фраза 5+ слов — скорее всего разговор, а не тайтл
+        if len(t.split()) >= 5:
+            return True
+        return False
 
     @router.message(F.text & ~F.text.startswith("/"))
     async def text_as_search(message: Message, state: FSMContext) -> None:
@@ -2722,18 +2781,55 @@ def make_router(
         if action == "show_list":
             await cmd_list(message)
             return True
+        if action == "show_watching":
+            await cmd_watching(message)
+            return True
+        if action == "show_watched":
+            await cmd_watched(message)
+            return True
         if action == "show_stats":
             await cmd_stats(message)
+            return True
+        if action == "show_cinema":
+            await cmd_cinema(message)
+            return True
+        if action == "show_upcoming":
+            await cmd_upcoming(message)
+            return True
+        if action == "show_subs":
+            # Команда из start.py — отправляем заглушку
+            await message.answer("📺 Открой /subs — там список твоих YouTube подписок.")
             return True
         if action == "find_trailer":
             title = (intent.get("title") or "").strip()
             if title:
-                # Делаем обычный поиск — юзер потом сам нажмёт «🎥 Трейлер»
-                await message.answer(f"🔎 Найду <b>{title}</b>, потом жми «🎥 Трейлер» под карточкой.", parse_mode="HTML")
+                await message.answer(
+                    f"🔎 Ищу <b>{title}</b> — найду карточку, потом жми «🎥 Трейлер».",
+                    parse_mode="HTML",
+                )
                 await _do_search_and_show(message.bot, message.chat.id, message.from_user.id, title)
             return True
+        if action == "where_for_title":
+            title = (intent.get("title") or "").strip()
+            if not title:
+                return False
+            async with session_factory() as session:
+                user = await repo.get_or_create_user(
+                    session, tg_id=message.from_user.id,
+                    username=message.from_user.username, full_name=message.from_user.full_name,
+                )
+                rows = await repo.list_user_series(session, user.id, status=None)
+            tl = title.lower()
+            matched = [s for _, s in rows if tl in (s.title_ru or "").lower() or tl in (s.title_en or "").lower()]
+            if matched:
+                await _show_where_for_series(message.bot, message.chat.id, matched[0])
+            else:
+                await message.answer(
+                    f"🤷 <b>{title}</b> нет в твоих списках. Сначала добавь через /add.",
+                    parse_mode="HTML",
+                )
+            return True
         if action == "suggest":
-            # Сразу запускаем _run_suggest с распознанными параметрами
             ct = intent.get("content_type") or "any"
             gn = (intent.get("genre") or "any").lower()
             if gn not in _GENRE_LABEL:
@@ -2746,6 +2842,15 @@ def make_router(
                 year_slug = f"{yf}_{yt}"
                 _YEAR_LABEL[year_slug] = f"📅 {yf}–{yt}"
             await _run_suggest(message.bot, message.chat.id, message.from_user.id, ct, gn, year_slug)
+            return True
+        if action == "chat":
+            response = (intent.get("response") or "").strip()
+            if response:
+                await message.answer(response, parse_mode="HTML")
+            else:
+                await message.answer(
+                    "🤔 Я тут чтобы помогать с сериалами. Попробуй /suggest, /upcoming, /cinema.",
+                )
             return True
         if action == "search":
             title = (intent.get("title") or "").strip()
