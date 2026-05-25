@@ -55,10 +55,15 @@ def card_keyboard(
             [InlineKeyboardButton(text="📺 Мой прогресс серий", callback_data=f"prog:{series_id}")]
         )
 
-    # Расписание сезонов — для сериалов (KP отдаёт даты выхода эпизодов)
+    # Расписание сезонов — для сериалов (KP отдаёт даты выхода эпизодов).
+    # Для фильмов — связанные части (sequels/prequels) если есть.
     if is_series:
         rows.append(
             [InlineKeyboardButton(text="🎞 Сезоны и серии", callback_data=f"seasons:{series_id}")]
+        )
+    else:
+        rows.append(
+            [InlineKeyboardButton(text="🎬 Связанные части", callback_data=f"parts:{series_id}")]
         )
 
     # Кнопка трейлера ВСЕГДА — если YouTube-id нет, фолбэк на TG-канал

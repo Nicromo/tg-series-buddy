@@ -32,6 +32,16 @@ class KPSearchHit:
 
 
 @dataclass
+class KPRelated:
+    """Связанный фильм/часть — для sequelsAndPrequels."""
+    kp_id: int
+    title_ru: str
+    year: Optional[int]
+    rating_kp: Optional[float]
+    poster_url: Optional[str]
+
+
+@dataclass
 class KPEpisode:
     number: int
     name: Optional[str]
@@ -77,6 +87,9 @@ class KPDetails:
     # Премьеры (ISO даты как строки, нормализованные в DD.MM.YYYY)
     premiere_world: Optional[str] = None
     premiere_russia: Optional[str] = None
+
+    # Связанные фильмы (sequels/prequels) — для кнопки «Части серии»
+    related: list[KPRelated] = field(default_factory=list)
 
     @property
     def best_trailer_youtube_id(self) -> Optional[str]:
@@ -401,6 +414,30 @@ class KinopoiskClient:
         premiere_world = _fmt_date(prem.get("world"))
         premiere_russia = _fmt_date(prem.get("russia"))
 
+        # Связанные фильмы — sequels/prequels (актуально для фильмов-франшиз)
+        related_raw = d.get("sequelsAndPrequels") or []
+        related: list[KPRelated] = []
+        seen_ids = set()
+        for r in related_raw:
+            try:
+                rid = int(r.get("id"))
+            except Exception:
+                continue
+            if rid == int(d.get("id", 0)) or rid in seen_ids:
+                continue  # сам себя или дубль
+            seen_ids.add(rid)
+            rating = (r.get("rating") or {}).get("kp")
+            poster = (r.get("poster") or {}).get("url") or (r.get("poster") or {}).get("previewUrl")
+            related.append(KPRelated(
+                kp_id=rid,
+                title_ru=r.get("name") or r.get("alternativeName") or "?",
+                year=r.get("year"),
+                rating_kp=float(rating) if rating else None,
+                poster_url=poster,
+            ))
+        # Сортируем по году чтобы шли в хронологическом порядке
+        related.sort(key=lambda x: x.year or 0)
+
         watch_options_raw = ((d.get("watchability") or {}).get("items") or [])
         watch_options = []
         for w in watch_options_raw[:6]:
@@ -429,4 +466,5 @@ class KinopoiskClient:
             tmdb_id=tmdb_id,
             premiere_world=premiere_world,
             premiere_russia=premiere_russia,
+            related=related,
         )

@@ -549,14 +549,29 @@ def make_router(
         series_id = int(call.data.split(":")[1])
         async with session_factory() as session:
             series = await session.get(Series, series_id)
-            if series is None or not getattr(series, "is_series", True):
-                await call.answer("Это не сериал — у фильмов нет сезонов")
+            if series is None:
+                await call.answer("Сериал не найден")
                 return
             kp_id = series.kp_id
             title = series.title_ru
         await call.answer("Загружаю расписание…")
         await call.bot.send_chat_action(call.message.chat.id, action="typing")
+        # Lazy-fix: проверим реальный is_series из KP (старые записи могли
+        # быть с дефолтным TRUE после миграции)
         try:
+            details = await kp.get_details(kp_id)
+            if not details.is_series:
+                async with session_factory() as session:
+                    db_s = await session.get(Series, series_id)
+                    if db_s:
+                        db_s.is_series = False
+                        await session.commit()
+                await call.message.answer(
+                    f"🎬 <b>{title}</b> — это фильм, а не сериал. "
+                    f"Перерисую карточку с правильными кнопками.",
+                    parse_mode="HTML",
+                )
+                return
             seasons = await kp.get_seasons(kp_id)
         except Exception as e:
             logger.exception("kp.get_seasons failed")
@@ -612,6 +627,75 @@ def make_router(
         if len(text) > 3900:
             text = text[:3900] + "\n…(обрезано)"
         await call.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+
+    @router.callback_query(F.data.startswith("parts:"))
+    async def cb_parts(call: CallbackQuery) -> None:
+        """Связанные части серии (для фильмов): sequelsAndPrequels от KP."""
+        series_id = int(call.data.split(":")[1])
+        async with session_factory() as session:
+            series = await session.get(Series, series_id)
+            if series is None:
+                await call.answer("Не нашёл в БД")
+                return
+            kp_id = series.kp_id
+            title = series.title_ru
+        await call.answer("Ищу части…")
+        await call.bot.send_chat_action(call.message.chat.id, action="typing")
+        try:
+            details = await kp.get_details(kp_id)
+        except Exception as e:
+            await call.message.answer(f"😕 Не получилось: {e}")
+            return
+        # Lazy-fix is_series — если KP считает что это сериал, перерисуем
+        if details.is_series:
+            async with session_factory() as session:
+                db_s = await session.get(Series, series_id)
+                if db_s:
+                    db_s.is_series = True
+                    await session.commit()
+            await call.message.answer(
+                f"📺 <b>{title}</b> — оказался сериалом! Перерисую с правильными кнопками.",
+                parse_mode="HTML",
+            )
+            return
+
+        related = details.related
+        if not related:
+            await call.message.answer(
+                f"🎬 У <b>{title}</b> нет связанных частей у КП.\n"
+                f"Это самостоятельный фильм или франшиза ещё не зафиксирована.",
+                parse_mode="HTML",
+            )
+            return
+
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        lines = [f"🎬 <b>{title}</b> · части серии ({len(related)}):", ""]
+        rows: list[list] = []
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            my_rows = await repo.list_user_series(session, user.id, status=None)
+            known_kp_ids = {s.kp_id for _, s in my_rows}
+        for i, r in enumerate(related, 1):
+            year_str = f" ({r.year})" if r.year else ""
+            rating_str = f" ⭐{r.rating_kp:.1f}" if r.rating_kp else ""
+            mark = " ✅" if r.kp_id in known_kp_ids else ""
+            marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
+            lines.append(f"{marker} <b>{r.title_ru}</b>{year_str}{rating_str}{mark}")
+            if r.kp_id not in known_kp_ids:
+                short = r.title_ru[:22] + "…" if len(r.title_ru) > 22 else r.title_ru
+                rows.append([IKB(text=f"➕ {i}. {short}", callback_data=f"addkp:{r.kp_id}")])
+        if not rows:
+            lines.append("")
+            lines.append("<i>Все части уже в твоих списках ✅</i>")
+        await call.message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=rows) if rows else None,
+            disable_web_page_preview=True,
+        )
 
     @router.callback_query(F.data.startswith("notify:"))
     async def cb_notify_toggle(call: CallbackQuery) -> None:
