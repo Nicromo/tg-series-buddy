@@ -29,6 +29,7 @@ class KPSearchHit:
     poster_url: Optional[str]
     short_description: Optional[str]
     rating_kp: Optional[float]
+    genres: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -247,6 +248,7 @@ class KinopoiskClient:
                 continue
             poster = (d.get("poster") or {}).get("url") or (d.get("poster") or {}).get("previewUrl")
             rating_kp = (d.get("rating") or {}).get("kp")
+            g_list = [g["name"] for g in (d.get("genres") or []) if g.get("name")]
             hits.append(KPSearchHit(
                 kp_id=int(d["id"]),
                 title_ru=d.get("name") or d.get("alternativeName") or "?",
@@ -255,6 +257,7 @@ class KinopoiskClient:
                 poster_url=poster,
                 short_description=d.get("shortDescription") or d.get("description"),
                 rating_kp=float(rating_kp) if rating_kp else None,
+                genres=g_list,
             ))
         return hits
 
@@ -293,6 +296,7 @@ class KinopoiskClient:
         for d in docs:
             poster = (d.get("poster") or {}).get("url") or (d.get("poster") or {}).get("previewUrl")
             rating_kp = (d.get("rating") or {}).get("kp")
+            genres = [g["name"] for g in (d.get("genres") or []) if g.get("name")]
             hits.append(KPSearchHit(
                 kp_id=int(d["id"]),
                 title_ru=d.get("name") or d.get("alternativeName") or "?",
@@ -301,6 +305,7 @@ class KinopoiskClient:
                 poster_url=poster,
                 short_description=d.get("shortDescription") or d.get("description"),
                 rating_kp=float(rating_kp) if rating_kp else None,
+                genres=genres,
             ))
         return hits
 
@@ -330,6 +335,7 @@ class KinopoiskClient:
         for d in docs:
             poster = (d.get("poster") or {}).get("url") or (d.get("poster") or {}).get("previewUrl")
             rating_kp = (d.get("rating") or {}).get("kp")
+            genres = [g["name"] for g in (d.get("genres") or []) if g.get("name")]
             hits.append(KPSearchHit(
                 kp_id=int(d["id"]),
                 title_ru=d.get("name") or d.get("alternativeName") or "?",
@@ -338,6 +344,7 @@ class KinopoiskClient:
                 poster_url=poster,
                 short_description=d.get("shortDescription") or d.get("description"),
                 rating_kp=float(rating_kp) if rating_kp else None,
+                genres=genres,
             ))
         return hits
 
@@ -367,6 +374,7 @@ class KinopoiskClient:
         for d in docs:
             poster = (d.get("poster") or {}).get("url") or (d.get("poster") or {}).get("previewUrl")
             rating_kp = (d.get("rating") or {}).get("kp")
+            genres = [g["name"] for g in (d.get("genres") or []) if g.get("name")]
             hits.append(KPSearchHit(
                 kp_id=int(d["id"]),
                 title_ru=d.get("name") or d.get("alternativeName") or "?",
@@ -375,6 +383,7 @@ class KinopoiskClient:
                 poster_url=poster,
                 short_description=d.get("shortDescription") or d.get("description"),
                 rating_kp=float(rating_kp) if rating_kp else None,
+                genres=genres,
             ))
         return hits
 

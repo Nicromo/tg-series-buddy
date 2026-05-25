@@ -2048,14 +2048,23 @@ def make_router(
             min_rating = user.min_rating if user.min_rating is not None else 7.0
             my_rows = await repo.list_user_series(session, user.id, status=None)
             known = {s.kp_id for _, s in my_rows}
+            blocked = {g.lower() for g in await repo.list_blacklisted_genres(session, user)}
 
         try:
-            hits = await kp.get_trending(min_rating=min_rating, days_back=60, limit=20)
+            # Берём с запасом — после blacklist-фильтра может остаться меньше
+            hits = await kp.get_trending(min_rating=min_rating, days_back=60, limit=30)
         except Exception as e:
             await stop_loading(message.bot, message.chat.id, loader)
             await message.answer(f"😕 KP заглох: {e}")
             return
-        fresh = [h for h in hits if h.kp_id not in known][:10]
+        # Фильтруем по blacklist жанров (case-insensitive, по любому из жанров тайтла)
+        def _allowed(h) -> bool:
+            if h.kp_id in known:
+                return False
+            if blocked and any(g.lower() in blocked for g in (h.genres or [])):
+                return False
+            return True
+        fresh = [h for h in hits if _allowed(h)][:10]
         await stop_loading(message.bot, message.chat.id, loader)
         if not fresh:
             await message.answer(
@@ -2117,6 +2126,7 @@ def make_router(
                         if g:
                             gc[g] += 1
             top_genres = [g for g, _ in gc.most_common(3)]
+            blocked = {g.lower() for g in await repo.list_blacklisted_genres(session, user)}
 
         try:
             if top_genres:
@@ -2127,7 +2137,13 @@ def make_router(
             await stop_loading(message.bot, message.chat.id, loader)
             await message.answer(f"😕 KP заглох: {e}")
             return
-        fresh = [h for h in hits if h.kp_id not in known_kp_ids][:10]
+        def _ok(h) -> bool:
+            if h.kp_id in known_kp_ids:
+                return False
+            if blocked and any(g.lower() in blocked for g in (h.genres or [])):
+                return False
+            return True
+        fresh = [h for h in hits if _ok(h)][:10]
         await stop_loading(message.bot, message.chat.id, loader)
         if not fresh:
             await message.answer(
@@ -2207,6 +2223,19 @@ def make_router(
             )
             my_rows = await repo.list_user_series(session, user.id, status=None)
             known_kp_ids = {s.kp_id for _, s in my_rows}
+            blocked = {g.lower() for g in await repo.list_blacklisted_genres(session, user)}
+        # Если юзер просит /top драма, а у него «драма» в blacklist — это его конфликт,
+        # не фильтруем сам запрошенный жанр. Только другие блок-жанры
+        blocked_filter = blocked - {genre.lower()}
+        if blocked_filter:
+            hits = [h for h in hits if not any(g.lower() in blocked_filter for g in (h.genres or []))]
+            if not hits:
+                await message.answer(
+                    f"🤷 По жанру «{genre}» нашлись тайтлы, но все попали под твой "
+                    f"чёрный список ({', '.join(sorted(blocked_filter))}). "
+                    f"Поправь в /blacklist."
+                )
+                return
 
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
         lines = [f"📊 <b>Топ-{len(hits)} по жанру «{genre}»:</b>", ""]
@@ -2913,17 +2942,25 @@ def make_router(
                         if g:
                             genre_counter[g] += 1
             top_genres = [g for g, _ in genre_counter.most_common(3)]
+            blocked = {g.lower() for g in await repo.list_blacklisted_genres(session, user)}
+
+        def _swipe_ok(h) -> bool:
+            if h.kp_id in known_kp_ids or not h.poster_url:
+                return False
+            if blocked and any(g.lower() in blocked for g in (h.genres or [])):
+                return False
+            return True
 
         # Тянем свежие сериалы из KP — сначала с подходящими жанрами, потом без
         candidates: list = []
         try:
             if top_genres:
                 hits = await kp.get_upcoming_series(genres=top_genres, limit=25)
-                candidates.extend(h for h in hits if h.kp_id not in known_kp_ids and h.poster_url)
+                candidates.extend(h for h in hits if _swipe_ok(h))
             if len(candidates) < 5:
                 hits = await kp.get_upcoming_series(limit=25)
                 for h in hits:
-                    if h.kp_id not in known_kp_ids and h.poster_url and h.kp_id not in {c.kp_id for c in candidates}:
+                    if _swipe_ok(h) and h.kp_id not in {c.kp_id for c in candidates}:
                         candidates.append(h)
         except Exception as e:
             logger.warning("kp.get_upcoming_series failed: %s", e)
