@@ -76,6 +76,27 @@ class KPDetails:
         return self.trailers[0] if self.trailers else None
 
 
+def _trailer_is_russian(name: str) -> bool:
+    """True если имя трейлера похоже на русскую озвучку."""
+    name = name.lower()
+    return "рус" in name or " ru " in f" {name} " or name.startswith("ru ")
+
+
+def _trailer_score(t: dict) -> int:
+    """Score для сортировки трейлеров: чем меньше, тем выше в списке.
+    Русские → лучше; «трейлер»/«trailer» → лучше; «тизер»/«teaser» → так себе.
+    """
+    name = (t.get("name") or "").lower()
+    score = 0
+    if _trailer_is_russian(name):
+        score += 10
+    if "трейлер" in name or "trailer" in name:
+        score += 5
+    if "тизер" in name or "teaser" in name:
+        score += 2
+    return -score
+
+
 def _extract_youtube_id(url: str) -> Optional[str]:
     """Из любой ссылки YouTube вытаскиваем 11-символьный id."""
     if not url:
@@ -203,31 +224,16 @@ class KinopoiskClient:
         elif d.get("totalSeasons"):
             seasons = int(d["totalSeasons"])
 
-        # Трейлеры
+        # Трейлеры: сортировка по _trailer_score
         trailers_raw = ((d.get("videos") or {}).get("trailers") or [])
-        # Сортируем: предпочитаем те, в названии которых есть "рус", "ru", "трейлер"
-        def _trailer_score(t: dict) -> int:
-            name = (t.get("name") or "").lower()
-            score = 0
-            if "рус" in name or " ru " in f" {name} " or name.startswith("ru "):
-                score += 10
-            if "трейлер" in name or "trailer" in name:
-                score += 5
-            if "тизер" in name or "teaser" in name:
-                score += 2
-            return -score  # сортируем по убыванию — лучшие первыми
-
         trailers_sorted = sorted(trailers_raw, key=_trailer_score)
         trailers = [t["url"] for t in trailers_sorted if t.get("url")]
 
         # Язык лучшего трейлера — по имени первого после сортировки
         best_trailer_language: Optional[str] = None
         if trailers_sorted:
-            best_name = (trailers_sorted[0].get("name") or "").lower()
-            if "рус" in best_name or " ru " in f" {best_name} " or best_name.startswith("ru "):
-                best_trailer_language = "ru"
-            else:
-                best_trailer_language = "en"
+            best_name = trailers_sorted[0].get("name") or ""
+            best_trailer_language = "ru" if _trailer_is_russian(best_name) else "en"
 
         watch_options_raw = ((d.get("watchability") or {}).get("items") or [])
         watch_options = []
