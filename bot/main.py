@@ -78,11 +78,60 @@ async def self_pinger(url: str, interval_s: int = 600) -> None:
             await asyncio.sleep(interval_s)
 
 
+def _init_sentry() -> None:
+    """Sentry — opt-in через env SENTRY_DSN. Без DSN не активируется."""
+    dsn = os.getenv("SENTRY_DSN", "").strip()
+    if not dsn:
+        return
+    try:
+        import sentry_sdk
+        sentry_sdk.init(
+            dsn=dsn,
+            traces_sample_rate=0.0,
+            send_default_pii=False,
+            environment=os.getenv("RENDER_SERVICE_NAME") or os.getenv("ENV") or "prod",
+        )
+        logging.info("Sentry initialized")
+    except Exception as e:
+        logging.warning("Sentry init failed: %s", e)
+
+
+def _setup_owner_alert(dp: Dispatcher, bot: Bot) -> None:
+    """Если задан OWNER_TG_ID — при unhandled exception в handler'е
+    шлём владельцу сообщение со stacktrace.
+    """
+    owner_raw = os.getenv("OWNER_TG_ID", "").strip()
+    if not owner_raw or not owner_raw.isdigit():
+        return
+    owner_id = int(owner_raw)
+
+    @dp.errors()
+    async def _on_error(event) -> bool:
+        logging.exception("Unhandled error: %s", event.exception)
+        import traceback
+        tb = "".join(traceback.format_exception(type(event.exception), event.exception, event.exception.__traceback__))
+        # Telegram message max 4096 — обрезаем
+        if len(tb) > 3500:
+            tb = tb[:3500] + "\n…(обрезано)"
+        try:
+            await bot.send_message(
+                owner_id,
+                f"🚨 <b>Ошибка в боте</b>\n<pre>{tb}</pre>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.warning("Owner alert failed: %s", e)
+        return True  # помечаем как обработанную, чтобы aiogram не валил выше
+
+    logging.info("Owner alert wired for TG id %s", owner_id)
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+    _init_sentry()
     settings = Settings.from_env()
     logging.info(
         "Starting bot. DB: %s, API: %s, Groq: %s",
@@ -101,6 +150,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(start_handlers.make_router(session_factory))
     dp.include_router(series_handlers.make_router(session_factory, kp, settings, groq))
+    _setup_owner_alert(dp, bot)
 
     port = int(os.getenv("PORT", "8080"))
     http_runner = await start_http_server(port, session_factory)

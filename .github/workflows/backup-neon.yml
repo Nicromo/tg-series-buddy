@@ -1,0 +1,53 @@
+name: Weekly Neon backup
+
+# Раз в неделю — pg_dump базы и сохраняем как artifact (хранится 90 дней
+# на GitHub бесплатно). Дополнительно тригерится вручную из вкладки Actions.
+#
+# Требует:
+#   - secrets.DATABASE_URL — строка вида
+#     postgresql://user:pass@host/db?sslmode=require (БЕЗ -pooler;
+#     direct endpoint Neon такой же как в Render)
+#
+# Чтобы добавить: GitHub repo → Settings → Secrets and variables →
+# Actions → New repository secret → name: DATABASE_URL.
+
+on:
+  schedule:
+    # Каждое воскресенье 03:00 UTC (06:00 МСК) — когда бот точно простаивает
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install PostgreSQL 16 client
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client-16
+
+      - name: Dump database
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set"; exit 1
+          fi
+          STAMP=$(date -u +'%Y%m%d-%H%M%S')
+          mkdir -p backups
+          # --no-owner / --no-acl чтобы restore работал на любую базу
+          pg_dump --no-owner --no-acl --clean --if-exists \
+            --format=custom \
+            --file="backups/neondb-${STAMP}.dump" \
+            "$DATABASE_URL"
+          ls -lh backups/
+
+      - name: Upload dump as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: neondb-backup
+          path: backups/*.dump
+          retention-days: 90

@@ -66,6 +66,8 @@ def start_scheduler(bot: Bot, session_factory: async_sessionmaker, kp: Kinopoisk
         args=[bot, session_factory],
         id="weekly_checkin",
         replace_existing=True,
+        coalesce=True,
+        misfire_grace_time=3600,
     )
     if kp is not None:
         # Каждый понедельник 09:00 UTC — проверка новых сезонов
