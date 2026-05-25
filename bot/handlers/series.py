@@ -61,6 +61,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from ..config import Settings
 from ..db import repository as repo
 from ..db.models import Series, UserSeries
+from ..keyboards.main_menu import main_menu
 from ..keyboards.series_kb import (
     bulk_move_keyboard,
     card_keyboard,
@@ -2303,7 +2304,9 @@ def make_router(
 
     @router.message(F.text == "📊 Статистика")
     async def btn_stats(message: Message) -> None:
+        # Кнопка из старой раскладки — обновим клавиатуру на новую
         await cmd_stats(message)
+        await message.answer("Кстати, меню снизу обновилось 👇", reply_markup=main_menu())
 
     @router.message(F.text == "👤 Профиль")
     async def btn_profile(message: Message) -> None:
