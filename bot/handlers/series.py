@@ -374,11 +374,29 @@ def make_router(
         title = series.title_ru if series else "сериал"
         if new_state:
             await call.answer("🔔 Включил уведомления")
-            await call.message.answer(
-                f"🔔 Подписался на новости по <b>{title}</b>.\n"
-                f"Дам знать когда выйдет новый сезон или фильм в прокат.",
-                parse_mode="HTML",
-            )
+            # Контекстный текст: что именно будет отслеживаться
+            status = (series.status_kp or "").lower() if series else ""
+            is_unreleased = status in (
+                "post-production", "pre-production", "announced", "filming", "in-production",
+            ) or not series.year or (series.year and series.year > 2025)
+            if is_unreleased:
+                lines = [
+                    f"🔔 Подписался на <b>{title}</b>.",
+                    "",
+                    "Напишу когда:",
+                    "🎥 выйдет трейлер (если ещё нет)",
+                    "📅 объявят/сдвинут дату премьеры (мир и Россия)",
+                    "🎬 фильм выйдет в прокат / сериал стартует",
+                ]
+            else:
+                lines = [
+                    f"🔔 Подписался на <b>{title}</b>.",
+                    "",
+                    "Напишу когда:",
+                    "🎬 выйдет новый сезон",
+                    "🎥 появится новый трейлер",
+                ]
+            await call.message.answer("\n".join(lines), parse_mode="HTML")
         else:
             await call.answer("🔕 Выключил уведомления")
             await call.message.answer(

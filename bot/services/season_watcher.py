@@ -92,6 +92,34 @@ async def check_new_seasons(bot: Bot, session_factory: async_sessionmaker, kp: K
                     f"{s.premiere_russia} → <b>{fresh.premiere_russia}</b>"
                 )
 
+        # 4. Появился трейлер (раньше не было, теперь есть)
+        new_yt = fresh.best_trailer_youtube_id
+        if new_yt and new_yt != (s.trailer_youtube_id or ""):
+            if not s.trailer_youtube_id:
+                notifications.append(
+                    f"🎥 У <b>{s.title_ru}</b> вышел трейлер!\n"
+                    f"https://www.youtube.com/watch?v={new_yt}"
+                )
+            # Если ютуб-id поменялся — обычно тизер → официальный трейлер.
+            # Тоже шлём, чтоб юзер увидел новую версию.
+            else:
+                notifications.append(
+                    f"🎥 У <b>{s.title_ru}</b> вышел новый трейлер:\n"
+                    f"https://www.youtube.com/watch?v={new_yt}"
+                )
+
+        # 5. Статус сменился на «вышел» (post-production → released / completed)
+        new_status = (fresh.status_kp or "").lower()
+        old_status = (s.status_kp or "").lower()
+        if (
+            new_status in ("released", "completed", "")
+            and old_status in ("post-production", "pre-production", "announced", "filming", "in-production")
+            and old_status
+        ):
+            notifications.append(
+                f"🎬 <b>{s.title_ru}</b> вышел! Уже можно смотреть."
+            )
+
         if not notifications:
             continue
 
@@ -107,6 +135,11 @@ async def check_new_seasons(bot: Bot, session_factory: async_sessionmaker, kp: K
                     db_s.premiere_world = fresh.premiere_world
                 if fresh.premiere_russia:
                     db_s.premiere_russia = fresh.premiere_russia
+                if new_yt and new_yt != db_s.trailer_youtube_id:
+                    db_s.trailer_youtube_id = new_yt
+                    db_s.trailer_language = fresh.best_trailer_language
+                    # Очищаем кэш file_id — старого файла нет, новый трейлер
+                    db_s.trailer_file_id = None
                 await session.commit()
 
         # Шлём пуш каждому подписчику
