@@ -93,6 +93,13 @@ def swipe_keyboard(series_id: int, queue_idx: int) -> InlineKeyboardMarkup:
         ]
     )
 
+def trailer_link_keyboard(url: str) -> InlineKeyboardMarkup:
+    """Одна кнопка-ссылка для трейлера — открывает YouTube в приложении."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="▶️ Открыть в YouTube", url=url)]]
+    )
+
+
 def bulk_move_keyboard(from_status: str, to_status: str, count: int) -> InlineKeyboardMarkup:
     """Кнопка 'перевести все' под списком."""
     labels = {

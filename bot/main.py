@@ -12,6 +12,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 import httpx
 from aiohttp import web
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from .config import Settings
 from .db.repository import init_db, make_engine, make_session_factory
@@ -35,18 +37,26 @@ BOT_COMMANDS = [
 ]
 
 
-async def _health(_: web.Request) -> web.Response:
-    return web.Response(text="ok")
-
-
 async def _root(_: web.Request) -> web.Response:
     return web.Response(text="series-bot is alive")
 
 
-async def start_http_server(port: int) -> web.AppRunner:
+def _make_health_handler(session_factory: async_sessionmaker):
+    async def _health(_: web.Request) -> web.Response:
+        try:
+            async with session_factory() as session:
+                await session.execute(text("SELECT 1"))
+        except Exception as e:
+            logging.warning("health: DB unreachable: %s", e)
+            return web.Response(text="db down", status=503)
+        return web.Response(text="ok")
+    return _health
+
+
+async def start_http_server(port: int, session_factory: async_sessionmaker) -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/", _root)
-    app.router.add_get("/health", _health)
+    app.router.add_get("/health", _make_health_handler(session_factory))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -93,7 +103,7 @@ async def main() -> None:
     dp.include_router(series_handlers.make_router(session_factory, kp, settings, groq))
 
     port = int(os.getenv("PORT", "8080"))
-    http_runner = await start_http_server(port)
+    http_runner = await start_http_server(port, session_factory)
     scheduler = start_scheduler(bot, session_factory, kp=kp)
 
     # Self-ping чтобы Render free не усыплял контейнер (раз в 10 мин)

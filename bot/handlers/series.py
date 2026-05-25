@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import random
 from collections import Counter
@@ -32,6 +33,7 @@ from ..keyboards.series_kb import (
     rating_only_keyboard,
     search_results_keyboard,
     swipe_keyboard,
+    trailer_link_keyboard,
 )
 from ..services.groq_ai import GroqClient
 from ..services.kinopoisk import KinopoiskClient, KPDetails
@@ -113,7 +115,7 @@ def _format_caption(s: Series, *, status: Optional[str] = None, rating: Optional
     # Где смотреть
     if getattr(s, "watch_options_json", None):
         try:
-            opts = __import__("json").loads(s.watch_options_json)
+            opts = json.loads(s.watch_options_json)
         except Exception:
             opts = []
         if opts:
@@ -173,7 +175,7 @@ def _details_to_series_dict(d: KPDetails) -> dict:
         "status_kp": d.status_kp,
         "trailer_youtube_id": d.best_trailer_youtube_id,
         "trailer_language": d.best_trailer_language,
-        "watch_options_json": __import__("json").dumps(d.watch_options) if d.watch_options else None,
+        "watch_options_json": json.dumps(d.watch_options) if d.watch_options else None,
     }
 
 
@@ -541,6 +543,7 @@ def make_router(
                 "\n".join(lines),
                 parse_mode="HTML",
                 disable_web_page_preview=False,
+                reply_markup=trailer_link_keyboard(youtube_url),
             )
             return
 
