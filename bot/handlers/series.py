@@ -2156,22 +2156,10 @@ def make_router(
         if not groq:
             await message.answer("🤖 Подбор от ИИ недоступен — нет GROQ_API_KEY")
             return
-        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
-        rows: list[list] = []
-        cur: list = []
-        for slug, label in _SUGGEST_TYPES:
-            cur.append(IKB(text=label, callback_data=f"sg:t:{slug}"))
-            if len(cur) >= 2:
-                rows.append(cur)
-                cur = []
-        if cur:
-            rows.append(cur)
-        rows.append([IKB(text="🎁 Чистый рандом — удиви", callback_data="sg:t:any:any")])
         await message.answer(
-            "✨ <b>Что вам подобрать?</b>\n\n"
-            "1️⃣ <b>Тип контента:</b>",
+            "✨ <b>Что вам подобрать?</b>\n\n1️⃣ <b>Тип контента:</b>",
             parse_mode="HTML",
-            reply_markup=IKM(inline_keyboard=rows),
+            reply_markup=_kb_step1_type(),
         )
 
     @router.message(F.text == "✨ Подобрать")
@@ -2248,54 +2236,27 @@ def make_router(
         await call.answer("🚫 Заблокирован" if new_state else "✅ Разрешён")
         await _render_blacklist(call, edit=True)
 
-    @router.callback_query(F.data.startswith("sg:t:"))
-    async def cb_suggest_type(call: CallbackQuery) -> None:
-        parts = call.data.split(":")
-        type_slug = parts[2]
-        # Если пришёл вариант «чистый рандом» — пропускаем жанр и год
-        if len(parts) >= 4 and parts[3] == "any":
-            await call.answer()
-            await _run_suggest(call.bot, call.message.chat.id, call.from_user.id, type_slug, "any", "any")
-            return
-        if type_slug not in _TYPE_LABEL:
-            await call.answer("Неизвестный тип")
-            return
-        # Получаем blacklist чтобы не показывать заблокированные жанры
-        async with session_factory() as session:
-            user = await repo.get_or_create_user(
-                session, tg_id=call.from_user.id,
-                username=call.from_user.username, full_name=call.from_user.full_name,
-            )
-            blocked = set(await repo.list_blacklisted_genres(session, user))
-
+    # ----- helpers рендера каждого шага (через edit_text одного сообщения) -----
+    async def _kb_step2_genre(tg_user_id: int, type_slug: str):
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(session, tg_id=tg_user_id, username=None, full_name=None)
+            blocked = set(await repo.list_blacklisted_genres(session, user))
         rows: list[list] = []
         cur: list = []
         for slug, label in _SUGGEST_GENRES:
             if slug != "any" and slug in blocked:
-                continue  # этот жанр в чёрном списке — не показываем
+                continue
             cur.append(IKB(text=label, callback_data=f"sg:g:{type_slug}:{slug}"))
             if len(cur) >= 2:
                 rows.append(cur)
                 cur = []
         if cur:
             rows.append(cur)
-        await call.answer()
-        header = f"Выбран: <b>{_TYPE_LABEL[type_slug]}</b>\n\n2️⃣ <b>Жанр?</b>"
-        if blocked:
-            blocked_labels = ", ".join(_GENRE_LABEL.get(b, b) for b in sorted(blocked))
-            header += f"\n\n<i>🚫 Скрыты из чёрного списка: {blocked_labels}</i>"
-        await call.message.answer(
-            header,
-            parse_mode="HTML",
-            reply_markup=IKM(inline_keyboard=rows),
-        )
+        rows.append([IKB(text="⬅️ Назад", callback_data="sg:back:1")])
+        return IKM(inline_keyboard=rows), blocked
 
-    @router.callback_query(F.data.startswith("sg:g:"))
-    async def cb_suggest_genre(call: CallbackQuery) -> None:
-        _, _, type_slug, genre_slug = call.data.split(":")
-        await call.answer()
-        # Шаг 3: год
+    def _kb_step3_year(type_slug: str, genre_slug: str):
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
         rows: list[list] = []
         cur: list = []
@@ -2306,12 +2267,64 @@ def make_router(
                 cur = []
         if cur:
             rows.append(cur)
-        await call.message.answer(
-            f"Выбран: <b>{_TYPE_LABEL.get(type_slug, '🎲')}</b> · <b>{_GENRE_LABEL.get(genre_slug, '🎲')}</b>\n\n"
-            "3️⃣ <b>Год выпуска?</b>",
-            parse_mode="HTML",
-            reply_markup=IKM(inline_keyboard=rows),
+        rows.append([IKB(text="⬅️ Назад", callback_data=f"sg:back:2:{type_slug}")])
+        return IKM(inline_keyboard=rows)
+
+    def _kb_step1_type():
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        rows: list[list] = []
+        cur: list = []
+        for slug, label in _SUGGEST_TYPES:
+            cur.append(IKB(text=label, callback_data=f"sg:t:{slug}"))
+            if len(cur) >= 2:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+        rows.append([IKB(text="🎁 Чистый рандом — удиви", callback_data="sg:t:any:any")])
+        return IKM(inline_keyboard=rows)
+
+    @router.callback_query(F.data.startswith("sg:t:"))
+    async def cb_suggest_type(call: CallbackQuery) -> None:
+        parts = call.data.split(":")
+        type_slug = parts[2]
+        # «Чистый рандом» — удаляем wizard и сразу к результату
+        if len(parts) >= 4 and parts[3] == "any":
+            await call.answer()
+            try:
+                await call.message.delete()
+            except Exception:
+                pass
+            await _run_suggest(call.bot, call.message.chat.id, call.from_user.id, type_slug, "any", "any")
+            return
+        if type_slug not in _TYPE_LABEL:
+            await call.answer("Неизвестный тип")
+            return
+        await call.answer()
+        kb, blocked = await _kb_step2_genre(call.from_user.id, type_slug)
+        header = f"✨ Подбор: <b>{_TYPE_LABEL[type_slug]}</b>\n\n2️⃣ <b>Жанр?</b>"
+        if blocked:
+            blocked_labels = ", ".join(_GENRE_LABEL.get(b, b) for b in sorted(blocked))
+            header += f"\n\n<i>🚫 Скрыты из чёрного списка: {blocked_labels}</i>"
+        try:
+            await call.message.edit_text(header, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            await call.message.answer(header, parse_mode="HTML", reply_markup=kb)
+
+    @router.callback_query(F.data.startswith("sg:g:"))
+    async def cb_suggest_genre(call: CallbackQuery) -> None:
+        _, _, type_slug, genre_slug = call.data.split(":")
+        await call.answer()
+        kb = _kb_step3_year(type_slug, genre_slug)
+        text = (
+            f"✨ Подбор: <b>{_TYPE_LABEL.get(type_slug, '🎲')}</b> · "
+            f"<b>{_GENRE_LABEL.get(genre_slug, '🎲')}</b>\n\n"
+            "3️⃣ <b>Год выпуска?</b>"
         )
+        try:
+            await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
 
     @router.callback_query(F.data.startswith("sg:y:"))
     async def cb_suggest_year(call: CallbackQuery, state: FSMContext) -> None:
@@ -2320,15 +2333,50 @@ def make_router(
             await state.set_state(SuggestYearFSM.waiting)
             await state.update_data(type_slug=type_slug, genre_slug=genre_slug)
             await call.answer()
-            await call.message.answer(
-                "✏️ Введи диапазон годов через дефис.\n"
-                "Например: <code>2015-2024</code> или <code>2010-2015</code>\n"
-                "/cancel — отменить",
-                parse_mode="HTML",
-            )
+            try:
+                await call.message.edit_text(
+                    "✏️ Введи диапазон годов через дефис.\n"
+                    "Например: <code>2015-2024</code>\n/cancel — отменить",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
             return
         await call.answer()
+        # Удаляем wizard перед результатом — он сам разбавит галерею
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
         await _run_suggest(call.bot, call.message.chat.id, call.from_user.id, type_slug, genre_slug, year_slug)
+
+    # «⬅️ Назад» — редактирует тот же месседж в предыдущий шаг
+    @router.callback_query(F.data.startswith("sg:back:"))
+    async def cb_suggest_back(call: CallbackQuery) -> None:
+        parts = call.data.split(":")
+        target = parts[2]
+        await call.answer()
+        if target == "1":
+            try:
+                await call.message.edit_text(
+                    "✨ <b>Что вам подобрать?</b>\n\n1️⃣ <b>Тип контента:</b>",
+                    parse_mode="HTML",
+                    reply_markup=_kb_step1_type(),
+                )
+            except Exception:
+                pass
+            return
+        if target == "2" and len(parts) >= 4:
+            type_slug = parts[3]
+            kb, blocked = await _kb_step2_genre(call.from_user.id, type_slug)
+            header = f"✨ Подбор: <b>{_TYPE_LABEL.get(type_slug, '🎲')}</b>\n\n2️⃣ <b>Жанр?</b>"
+            if blocked:
+                blocked_labels = ", ".join(_GENRE_LABEL.get(b, b) for b in sorted(blocked))
+                header += f"\n\n<i>🚫 Скрыты из чёрного списка: {blocked_labels}</i>"
+            try:
+                await call.message.edit_text(header, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
 
     @router.message(SuggestYearFSM.waiting, Command("cancel"))
     async def suggest_year_cancel(message: Message, state: FSMContext) -> None:
