@@ -3,13 +3,15 @@
 start_loading() шлёт анимированное сообщение, возвращает message_id.
 stop_loading(message_id) удаляет его.
 
-Источники GIF в порядке приоритета:
+Источники анимации в порядке приоритета:
 1. env LOADING_GIF_URLS — список URL через запятую (Tenor/Giphy/CDN).
-2. Fallback — обычное сообщение с эмодзи (Telegram сам анимирует
-   одиночные эмодзи, выглядит почти как стикер).
+2. send_dice — нативная Telegram-анимация с эмодзи 🎲/🎯/🎰/⚽/🏀
+   (играет ~3 сек). Не требует URL, всегда работает, выглядит живо.
+3. Fallback — текстовое сообщение с эмодзи.
 
-Пример env (можно положить любые забавные гифки):
-  LOADING_GIF_URLS=https://media.tenor.com/abc.gif,https://media.tenor.com/xyz.gif
+Поведение по умолчанию: если LOADING_GIF_URLS не задан, используем
+send_dice (живая анимация). Если хочешь отключить и оставить только
+текст: LOADING_DICE=false в env.
 """
 
 from __future__ import annotations
@@ -40,9 +42,15 @@ _PHRASES = [
 ]
 
 
+_DICE_EMOJIS = ["🎲", "🎯", "🎰", "⚽", "🏀", "🎳"]
+
+
+def _dice_enabled() -> bool:
+    return os.getenv("LOADING_DICE", "true").lower() in ("1", "true", "yes")
+
+
 async def start_loading(bot: Bot, chat_id: int) -> Optional[int]:
-    """Показывает «думаю» сообщение. Возвращает message_id для удаления.
-    None если ничего не отправлено (редкий случай ошибки)."""
+    """Показывает «думаю» сообщение. Возвращает message_id для удаления."""
     urls = _load_urls()
     if urls:
         gif = random.choice(urls)
@@ -51,7 +59,14 @@ async def start_loading(bot: Bot, chat_id: int) -> Optional[int]:
             return m.message_id
         except Exception as e:
             logger.warning("loading gif %s failed: %s", gif, e)
-    # Fallback: одиночное сообщение с эмодзи — Telegram анимирует
+    # Нативная Telegram-анимация: send_dice играет ~3 сек.
+    if _dice_enabled():
+        try:
+            m = await bot.send_dice(chat_id, emoji=random.choice(_DICE_EMOJIS))
+            return m.message_id
+        except Exception as e:
+            logger.warning("loading dice failed: %s", e)
+    # Fallback: текст с фразой
     try:
         m = await bot.send_message(chat_id, random.choice(_PHRASES))
         return m.message_id
@@ -68,3 +83,23 @@ async def stop_loading(bot: Bot, chat_id: int, message_id: Optional[int]) -> Non
     except Exception:
         # Не critical — например юзер сам удалил
         pass
+
+
+class with_loader:
+    """Async context manager:
+        async with with_loader(bot, chat_id):
+            ...твоя долгая работа...
+    Сам создаёт и удаляет loading-сообщение."""
+
+    def __init__(self, bot: Bot, chat_id: int):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.msg_id: Optional[int] = None
+
+    async def __aenter__(self):
+        self.msg_id = await start_loading(self.bot, self.chat_id)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await stop_loading(self.bot, self.chat_id, self.msg_id)
+        return False

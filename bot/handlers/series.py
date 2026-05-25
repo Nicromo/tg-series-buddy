@@ -71,7 +71,7 @@ from ..keyboards.series_kb import (
 )
 from ..services.groq_ai import GroqClient
 from ..services.kinopoisk import KinopoiskClient, KPDetails
-from ..services.loading import start_loading, stop_loading
+from ..services.loading import start_loading, stop_loading, with_loader
 from ..services.wallpaper import build_week_wallpaper
 from ..services.scheduler import run_weekly_checkin
 from ..services.trailer import find_trailer_tg_link
@@ -567,9 +567,7 @@ def make_router(
             kp_id = series.kp_id
             title = series.title_ru
         await call.answer("Загружаю расписание…")
-        await call.bot.send_chat_action(call.message.chat.id, action="typing")
-        # Lazy-fix: проверим реальный is_series из KP (старые записи могли
-        # быть с дефолтным TRUE после миграции)
+        loader = await start_loading(call.bot, call.message.chat.id)
         try:
             details = await kp.get_details(kp_id)
             if not details.is_series:
@@ -578,6 +576,7 @@ def make_router(
                     if db_s:
                         db_s.is_series = False
                         await session.commit()
+                await stop_loading(call.bot, call.message.chat.id, loader)
                 await call.message.answer(
                     f"🎬 <b>{title}</b> — это фильм, а не сериал. "
                     f"Перерисую карточку с правильными кнопками.",
@@ -587,8 +586,10 @@ def make_router(
             seasons = await kp.get_seasons(kp_id)
         except Exception as e:
             logger.exception("kp.get_seasons failed")
+            await stop_loading(call.bot, call.message.chat.id, loader)
             await call.message.answer(f"😕 Не получилось загрузить сезоны: {e}")
             return
+        await stop_loading(call.bot, call.message.chat.id, loader)
         if not seasons:
             await call.message.answer(
                 f"📺 У <b>{title}</b> у KP пока нет данных по сезонам.\n"
@@ -967,6 +968,7 @@ def make_router(
             return
 
         # 2) Ничего нет в БД — поищем через все источники
+        loader = await start_loading(call.bot, call.message.chat.id)
         await call.bot.send_chat_action(call.message.chat.id, action="typing")
         imdb_id = tmdb_id = None
         is_series_flag = True
@@ -1008,6 +1010,7 @@ def make_router(
                         s.trailer_language = "ru"  # RuTube почти всегда русский
                     await session.commit()
             only_en_now = only_en if extracted_yt else False
+            await stop_loading(call.bot, call.message.chat.id, loader)
             if extracted_yt and _inline_video_enabled and await _try_send_inline_video(
                 call.message.chat.id, call.bot,
                 title=title, youtube_id=extracted_yt, only_english=only_en_now,
@@ -1021,6 +1024,7 @@ def make_router(
 
         # 3) TG-канал
         tg_link = await find_trailer_tg_link(title, year)
+        await stop_loading(call.bot, call.message.chat.id, loader)
         if tg_link:
             await call.message.answer(
                 f"🎥 Нашёл трейлер в TG-канале: {tg_link}",
@@ -1739,12 +1743,14 @@ def make_router(
         return IKM(inline_keyboard=rows)
 
     async def _send_cinema_for_city(bot: Bot, chat_id: int, city_slug: str, city_name: str) -> None:
-        await bot.send_chat_action(chat_id, action="typing")
+        loader = await start_loading(bot, chat_id)
         try:
             hits = await kp.get_movies_in_theaters(limit=15)
         except Exception as e:
+            await stop_loading(bot, chat_id, loader)
             await bot.send_message(chat_id, f"😕 KP заглох: {e}")
             return
+        await stop_loading(bot, chat_id, loader)
         if not hits:
             await bot.send_message(chat_id, "🎫 Сейчас в прокате ничего не нашлось у KP.")
             return
@@ -2088,7 +2094,7 @@ def make_router(
     # ============== /upcoming — премьеры под жанры пары ==============
     @router.message(Command("upcoming"))
     async def cmd_upcoming(message: Message) -> None:
-        await message.bot.send_chat_action(message.chat.id, action="typing")
+        loader = await start_loading(message.bot, message.chat.id)
         async with session_factory() as session:
             user = await repo.get_or_create_user(
                 session, tg_id=message.from_user.id,
@@ -2116,9 +2122,11 @@ def make_router(
             else:
                 hits = await kp.get_upcoming_series(limit=25)
         except Exception as e:
+            await stop_loading(message.bot, message.chat.id, loader)
             await message.answer(f"😕 KP заглох: {e}")
             return
         fresh = [h for h in hits if h.kp_id not in known_kp_ids][:10]
+        await stop_loading(message.bot, message.chat.id, loader)
         if not fresh:
             await message.answer(
                 "📅 Не нашёл новых премьер под ваши жанры.\n"
@@ -2174,15 +2182,16 @@ def make_router(
             )
             return
         genre = parts[1].strip().lower()
-        await message.bot.send_chat_action(message.chat.id, action="typing")
+        loader = await start_loading(message.bot, message.chat.id)
         try:
-            # Сначала пробуем как сериалы — пара же смотрит сериалы. Если пусто — фильмы.
             hits = await kp.get_top_by_genre(genre, is_series=True, limit=10)
             if not hits:
                 hits = await kp.get_top_by_genre(genre, limit=10)
         except Exception as e:
+            await stop_loading(message.bot, message.chat.id, loader)
             await message.answer(f"😕 KP заглох: {e}")
             return
+        await stop_loading(message.bot, message.chat.id, loader)
         if not hits:
             await message.answer(
                 f"🤷 По жанру «{genre}» ничего не нашёл. Проверь написание.",
@@ -2864,7 +2873,7 @@ def make_router(
     # ============== /swipe — Tinder для новых сериалов ==============
     @router.message(Command("swipe"))
     async def cmd_swipe(message: Message, state: FSMContext) -> None:
-        await message.bot.send_chat_action(message.chat.id, action="typing")
+        loader = await start_loading(message.bot, message.chat.id)
         async with session_factory() as session:
             user = await repo.get_or_create_user(
                 session, tg_id=message.from_user.id,
@@ -2904,6 +2913,7 @@ def make_router(
         except Exception as e:
             logger.warning("kp.get_upcoming_series failed: %s", e)
 
+        await stop_loading(message.bot, message.chat.id, loader)
         if not candidates:
             await message.answer(
                 "🃏 Не нашёл новых сериалов для свайпа. Попробуй позже или используй /suggest.",
