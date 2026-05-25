@@ -3094,6 +3094,26 @@ def make_router(
             return True
         return False
 
+    # Локальная эвристика для типичных команд — быстрее Groq на ~1-2 сек.
+    _QUICK_PATTERNS = (
+        (("покажи список", "мои фильмы", "мой список", "что хочу", "хочу посмотреть"), "show_list"),
+        (("что смотрю", "сейчас смотрю", "что смотрим"), "show_watching"),
+        (("что досмотрел", "досмотренное", "что мы досмотрели"), "show_watched"),
+        (("моя статистика", "стата", "сколько у меня"), "show_stats"),
+        (("что в кино", "афиша", "сегодня в кино"), "show_cinema"),
+        (("новинки", "что новенького", "новое"), "show_upcoming"),
+        (("мой профиль", "профиль", "настройки"), "show_profile"),
+        (("чёрный список", "черный список", "blacklist"), "show_blacklist"),
+        (("громкие новинки", "трендинг", "trending"), "show_trending"),
+    )
+
+    def _try_quick_intent(text: str) -> Optional[str]:
+        t = text.lower().strip()
+        for phrases, action in _QUICK_PATTERNS:
+            if any(p in t for p in phrases):
+                return action
+        return None
+
     @router.message(F.text & ~F.text.startswith("/"))
     async def text_as_search(message: Message, state: FSMContext) -> None:
         current_state = await state.get_state()
@@ -3109,7 +3129,13 @@ def make_router(
         if bulk:
             await _bulk_add_titles(message.bot, message.chat.id, message.from_user.id, bulk)
             return
-        # Текст похож на команду — спросим Groq что хотел юзер
+        # Локальная эвристика — обрабатываем мгновенно без Groq
+        quick = _try_quick_intent(text)
+        if quick:
+            handled = await _handle_intent(message, {"action": quick})
+            if handled:
+                return
+        # Текст похож на сложную команду — спрашиваем Groq
         if groq and _looks_like_command(text):
             loader = await start_loading(message.bot, message.chat.id)
             try:
@@ -3188,6 +3214,12 @@ def make_router(
             return True
         if action == "show_upcoming":
             await cmd_upcoming(message)
+            return True
+        if action == "show_profile":
+            await cmd_profile(message)
+            return True
+        if action == "show_trending":
+            await cmd_trending(message)
             return True
         if action == "show_subs":
             # Команда из start.py — отправляем заглушку

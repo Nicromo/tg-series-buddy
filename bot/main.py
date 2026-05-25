@@ -27,23 +27,12 @@ from .services.scheduler import start_scheduler
 BOT_COMMANDS = [
     BotCommand(command="today",    description="🍿 Что смотреть сегодня"),
     BotCommand(command="add",      description="➕ Добавить сериал или фильм"),
-    BotCommand(command="list",     description="📋 Наш общий список «хочу»"),
-    BotCommand(command="watching", description="▶️ Смотрим сейчас"),
-    BotCommand(command="upcoming", description="📅 Премьеры под ваши жанры"),
-    BotCommand(command="cinema",   description="🎫 Что в кино в твоём городе"),
-    BotCommand(command="poll",     description="🗳 Выбираем вместе"),
-    BotCommand(command="where",    description="📺 Где смотреть"),
-    BotCommand(command="pair",     description="👫 Связаться с партнёром"),
-    BotCommand(command="subs",     description="📺 YouTube подписки"),
+    BotCommand(command="list",     description="📋 Наш общий список"),
     BotCommand(command="suggest",  description="🪄 Подбор от ИИ"),
-    BotCommand(command="blacklist", description="🚫 Жанры-табу для ИИ"),
-    BotCommand(command="swipe",    description="🃏 Свайп-вечер"),
-    BotCommand(command="profile",  description="👤 Профиль и настройки"),
-    BotCommand(command="trending", description="🔥 Громкие новинки недели"),
-    BotCommand(command="stats",    description="📊 Статистика"),
-    BotCommand(command="wallpaper",description="📸 Постер «Наша неделя»"),
-    BotCommand(command="donate",   description="💛 Поддержать бота"),
-    BotCommand(command="menu",     description="✨ Главное меню"),
+    BotCommand(command="trending", description="🔥 Громкие новинки"),
+    BotCommand(command="cinema",   description="🎫 Что в кино"),
+    BotCommand(command="profile",  description="👤 Профиль"),
+    BotCommand(command="menu",     description="📂 Все возможности"),
 ]
 
 

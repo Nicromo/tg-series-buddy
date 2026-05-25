@@ -173,9 +173,106 @@ def make_router(session_factory: async_sessionmaker) -> Router:
     async def cmd_help(message: Message) -> None:
         await message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=main_menu())
 
+    # ---------- Иерархический /menu ----------
+    _MENU_GROUPS = {
+        "lists": ("📺 Списки сериалов и фильмов", [
+            ("/list",     "Наш общий «👀 хочу посмотреть»"),
+            ("/watching", "▶️ Смотрим сейчас"),
+            ("/watched",  "✅ Досмотрели"),
+            ("/rewatch",  "🔁 Хотим пересмотреть"),
+            ("/find <запрос>", "🔎 Поиск в наших"),
+            ("/wallpaper", "📸 Постер «Наша неделя»"),
+        ]),
+        "discover": ("✨ Подбор и обнаружение", [
+            ("/today",     "🍿 Что включить сегодня"),
+            ("/random",    "🎲 Случайный из очереди"),
+            ("/suggest",   "🪄 ИИ-подбор (тип/жанр/год/страна)"),
+            ("/swipe",     "🃏 Свайп новых сериалов"),
+            ("/trending",  "🔥 Громкие новинки недели"),
+            ("/upcoming",  "📅 Премьеры под ваши жанры"),
+            ("/top <жанр>", "📊 Топ-10 КП по жанру"),
+        ]),
+        "around": ("🎫 Окружение", [
+            ("/cinema",  "🎫 Что в кино + сеансы в твоём городе"),
+            ("/where",   "📺 Где смотреть из активных"),
+        ]),
+        "social": ("👫 Социальное", [
+            ("/pair", "👫 Связаться с партнёром"),
+            ("/poll", "🗳 Голосование «что включим»"),
+        ]),
+        "youtube": ("📺 YouTube", [
+            ("/sub",  "➕ Подписаться на канал"),
+            ("/subs", "📺 Мои YouTube подписки"),
+        ]),
+        "me": ("👤 Я и настройки", [
+            ("/profile",   "👤 Профиль + статистика"),
+            ("/blacklist", "🚫 Жанры-табу для ИИ"),
+            ("/stats",     "📊 Статистика"),
+            ("/checkin",   "🔔 Опрос про активные"),
+            ("/donate",    "💛 Поддержать бота"),
+        ]),
+    }
+
     @router.message(Command("menu"))
     async def cmd_menu(message: Message) -> None:
-        await message.answer("Меню обновлено 👇", reply_markup=main_menu())
+        rows = [
+            [InlineKeyboardButton(text=title, callback_data=f"menugrp:{slug}")]
+            for slug, (title, _) in _MENU_GROUPS.items()
+        ]
+        rows.append([InlineKeyboardButton(text="ℹ️ Полная справка", callback_data="menugrp:help")])
+        await message.answer(
+            "📂 <b>Что умеет бот</b>\n\nВыбери раздел:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+        # И обновим reply-keyboard на всякий случай
+        await message.answer("Меню снизу обновлено 👇", reply_markup=main_menu())
+
+    @router.callback_query(F.data.startswith("menugrp:"))
+    async def cb_menu_group(call: CallbackQuery) -> None:
+        slug = call.data.split(":", 1)[1]
+        await call.answer()
+        if slug == "help":
+            try:
+                await call.message.edit_text(HELP_TEXT, parse_mode="HTML",
+                                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                                  InlineKeyboardButton(text="⬅️ Назад", callback_data="menugrp:back")
+                                              ]]))
+            except Exception:
+                pass
+            return
+        if slug == "back":
+            rows = [
+                [InlineKeyboardButton(text=title, callback_data=f"menugrp:{s}")]
+                for s, (title, _) in _MENU_GROUPS.items()
+            ]
+            rows.append([InlineKeyboardButton(text="ℹ️ Полная справка", callback_data="menugrp:help")])
+            try:
+                await call.message.edit_text(
+                    "📂 <b>Что умеет бот</b>\n\nВыбери раздел:",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                )
+            except Exception:
+                pass
+            return
+        group = _MENU_GROUPS.get(slug)
+        if not group:
+            return
+        title, items = group
+        lines = [f"<b>{title}</b>", ""]
+        for cmd, desc in items:
+            lines.append(f"<code>{cmd}</code> — {desc}")
+        try:
+            await call.message.edit_text(
+                "\n".join(lines),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="⬅️ К разделам", callback_data="menugrp:back")
+                ]]),
+            )
+        except Exception:
+            pass
 
     def _join_code_keyboard() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[[

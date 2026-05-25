@@ -348,14 +348,23 @@ async def send_suggestions_gallery(
     Используется в /suggest и в «похожие на этот»."""
     message_ids: list[int] = []
     items: list[tuple] = []
+    # Параллельные KP-запросы — экономим N×время на одной подборке
+    import asyncio as _asyncio
+    queries = []
     for sug in suggestions[:10]:
-        query = f"{sug.title} {sug.year}" if sug.year else sug.title
-        try:
-            hits = await kp.search(query, limit=1)
-            if hits:
-                items.append((sug, hits[0]))
-        except Exception as e:
-            logger.warning("KP search for suggestion failed: %s", e)
+        q = f"{sug.title} {sug.year}" if sug.year else sug.title
+        queries.append((sug, kp.search(q, limit=1)))
+    try:
+        results = await _asyncio.gather(*(coro for _, coro in queries), return_exceptions=True)
+    except Exception as e:
+        logger.warning("Parallel KP search batch failed: %s", e)
+        results = []
+    for (sug, _), res in zip(queries, results):
+        if isinstance(res, Exception):
+            logger.warning("KP search for %s failed: %s", sug.title, res)
+            continue
+        if res:
+            items.append((sug, res[0]))
 
     if not items:
         # Фолбэк — текст без постеров

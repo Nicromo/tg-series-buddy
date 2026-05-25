@@ -166,6 +166,12 @@ class KinopoiskClient:
             headers={"X-API-KEY": api_key, "Accept": "application/json"},
             follow_redirects=True,
         )
+        # In-memory LRU кеш для search — 10 мин TTL. Повторные запросы по
+        # одному и тому же тайтлу (например в /suggest для 5 предложений
+        # одних и тех же сериалов в разных подборках) — мгновенно.
+        self._search_cache: dict[str, tuple[float, list[KPSearchHit]]] = {}
+        self._search_cache_ttl = 600.0  # 10 минут
+        self._search_cache_max = 200
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -174,9 +180,12 @@ class KinopoiskClient:
 
     async def search(self, query: str, *, limit: int = 5) -> list[KPSearchHit]:
         """Поиск по названию, отдаёт первые `limit` результатов.
-
-        Сериалы и фильмы вперемешку — фильтруем сериалы на стороне клиента.
-        """
+        Кешируется на 10 минут — повторные запросы мгновенные."""
+        import time as _time
+        key = f"{query.strip().lower()}::{limit}"
+        cached = self._search_cache.get(key)
+        if cached and (_time.time() - cached[0] < self._search_cache_ttl):
+            return cached[1]
         resp = await self._client.get(
             "/movie/search",
             params={"query": query, "limit": limit * 3, "page": 1},
@@ -201,6 +210,13 @@ class KinopoiskClient:
             )
             if len(hits) >= limit:
                 break
+        # Сохраняем в кеш + чистим если переросло max
+        self._search_cache[key] = (_time.time(), hits)
+        if len(self._search_cache) > self._search_cache_max:
+            # Удаляем самые старые (10 самых старых за раз)
+            oldest = sorted(self._search_cache.items(), key=lambda x: x[1][0])[:10]
+            for k, _ in oldest:
+                self._search_cache.pop(k, None)
         return hits
 
 
