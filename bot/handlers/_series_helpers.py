@@ -318,11 +318,25 @@ async def send_suggestions_gallery(
     if not sent_caption:
         await bot.send_message(chat_id, caption, parse_mode="HTML")
 
-    add_row = [InlineKeyboardButton(text=f"➕ {i}", callback_data=f"addkp:{hit.kp_id}") for i, (_, hit) in enumerate(items, 1)]
-    seen_row = [InlineKeyboardButton(text=f"✅ {i}", callback_data=f"seenkp:{hit.kp_id}") for i, (_, hit) in enumerate(items, 1)]
-    trailer_row = [InlineKeyboardButton(text=f"🎬 {i}", callback_data=f"trkp:{hit.kp_id}") for i, (_, hit) in enumerate(items, 1)]
+    # Кнопки одной строкой на сериал — сразу понятно куда что:
+    #   [ ➕ Добавить «Severance» ]
+    #   [ ✅ Уже смотрел ]  [ 🎥 Трейлер ]
+    rows: list[list[InlineKeyboardButton]] = []
+    for sug, hit in items:
+        title_full = hit.title_ru or sug.title or ""
+        title_short = title_full[:22] + "…" if len(title_full) > 22 else title_full
+        rows.append([
+            InlineKeyboardButton(
+                text=f"➕ Добавить «{title_short}»",
+                callback_data=f"addkp:{hit.kp_id}",
+            ),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="✅ Уже смотрел", callback_data=f"seenkp:{hit.kp_id}"),
+            InlineKeyboardButton(text="🎥 Трейлер", callback_data=f"trkp:{hit.kp_id}"),
+        ])
     await bot.send_message(
         chat_id,
-        "➕ — добавить в «Хочу», ✅ — уже смотрел (больше не предлагать), 🎬 — трейлер",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[add_row, seen_row, trailer_row]),
+        "Выбирай 👇",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )

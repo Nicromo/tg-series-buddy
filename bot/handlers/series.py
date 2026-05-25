@@ -801,12 +801,14 @@ def make_router(
         if len(rows) > 10:
             lines.append("")
             lines.append(f"<i>… показал первые 10 из {len(rows)}. /find для поиска.</i>")
+        lines.append("")
+        lines.append("<i>👇 Жми номер чтобы открыть полную карточку</i>")
 
-        # Кнопки 1-N (по 5 в ряд)
+        # Кнопки 1-N (по 5 в ряд) — иконка глаза подсказывает «открыть»
         btn_rows: list[list] = []
         cur: list = []
         for i, (_, s) in enumerate(items, 1):
-            cur.append(IKB(text=str(i), callback_data=f"open:{s.id}"))
+            cur.append(IKB(text=f"👁 {i}", callback_data=f"open:{s.id}"))
             if len(cur) >= 5:
                 btn_rows.append(cur)
                 cur = []
@@ -978,11 +980,13 @@ def make_router(
         if len(matches) > 10:
             lines.append("")
             lines.append(f"<i>… показал первые 10 из {len(matches)}.</i>")
+        lines.append("")
+        lines.append("<i>👇 Жми номер чтобы открыть полную карточку</i>")
 
         btn_rows: list[list] = []
         cur: list = []
         for i, s in enumerate(items, 1):
-            cur.append(IKB(text=str(i), callback_data=f"open:{s.id}"))
+            cur.append(IKB(text=f"👁 {i}", callback_data=f"open:{s.id}"))
             if len(cur) >= 5:
                 btn_rows.append(cur)
                 cur = []
