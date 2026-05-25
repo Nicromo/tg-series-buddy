@@ -11,11 +11,20 @@
    "<название> русский трейлер <год>" → первый videoId. 10К запросов
    в день бесплатно (1 search = 100 units).
 
-3. **Piped** — без ключа. Публичные инстансы (zaggy.nl, kavin.rocks
+3. **Piped** — без ключа. Публичные инстансы (kavin.rocks, adminforge
    и др.) проксируют YouTube API. Падают периодически — пытаемся
    несколько по очереди.
 
-4. **YouTube search URL fallback** — если ничего не нашли, возвращаем
+4. **Invidious** — без ключа, другой набор публичных инстансов
+   (privacyredirect, yewtu.be и др.). Дополняет Piped: если один
+   набор лежит — обычно другой работает.
+
+5. **DuckDuckGo HTML search** — без ключа. Парсим HTML страницы
+   результатов с фильтром site:youtube.com, достаём первый
+   youtube.com/watch?v=... URL. DDG не банит за частые запросы
+   как Google.
+
+6. **YouTube search URL fallback** — если ничего не нашли, возвращаем
    ссылку на страницу поиска YouTube. Telegram отрендерит preview,
    юзер выберет нужный сам. Никогда не пусто.
 
@@ -43,6 +52,20 @@ PIPED_INSTANCES = [
     "https://api.piped.privacydev.net",
     "https://pipedapi.r4fo.com",
 ]
+
+# Invidious — аналог Piped, ещё больше публичных инстансов
+INVIDIOUS_INSTANCES = [
+    "https://invidious.privacyredirect.com",
+    "https://yewtu.be",
+    "https://invidious.nerdvpn.de",
+    "https://inv.nadeko.net",
+]
+
+# User-Agent — DuckDuckGo HTML банит default httpx
+UA_BROWSER = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 
@@ -245,6 +268,68 @@ class TrailerFinder:
                     continue
         return None
 
+    # ---------- Источник 4: Invidious (без ключа) ----------
+
+    async def from_invidious(self, *, title: str, year: Optional[int]) -> Optional[str]:
+        q = _ru_query(title, year)
+        async with httpx.AsyncClient(timeout=self._timeout) as c:
+            for instance in INVIDIOUS_INSTANCES:
+                try:
+                    r = await c.get(
+                        f"{instance}/api/v1/search",
+                        params={"q": q, "type": "video", "region": "RU"},
+                    )
+                    if r.status_code != 200:
+                        continue
+                    items = r.json() or []
+                    for it in items[:5]:
+                        vid = it.get("videoId")
+                        if vid and re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+                            return vid
+                except Exception as e:
+                    logger.warning("Invidious %s failed: %s", instance, e)
+                    continue
+        return None
+
+    # ---------- Источник 5: DuckDuckGo HTML (без ключа) ----------
+
+    async def from_duckduckgo(self, *, title: str, year: Optional[int]) -> Optional[str]:
+        """HTML парсинг DDG. Ищет «<title> русский трейлер» + site:youtube.com
+        и достаёт первый YouTube videoId из ссылок."""
+        q = _ru_query(title, year) + " site:youtube.com"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout,
+                headers={"User-Agent": UA_BROWSER},
+                follow_redirects=True,
+            ) as c:
+                r = await c.post(
+                    "https://html.duckduckgo.com/html/",
+                    data={"q": q},
+                )
+                if r.status_code != 200:
+                    logger.warning("DDG status %s", r.status_code)
+                    return None
+                # DDG оборачивает результаты в href=/l/?uddg=<encoded>...
+                # Достаём YouTube id и из прямых, и из обёрнутых URL.
+                html = r.text
+                # Прямой /watch?v=ID
+                m = re.search(r"youtube\.com%2Fwatch%3Fv%3D([A-Za-z0-9_-]{11})", html)
+                if m:
+                    return m.group(1)
+                m = re.search(r"youtube\.com/watch\?v=([A-Za-z0-9_-]{11})", html)
+                if m:
+                    return m.group(1)
+                m = re.search(r"youtu\.be%2F([A-Za-z0-9_-]{11})", html)
+                if m:
+                    return m.group(1)
+                m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", html)
+                if m:
+                    return m.group(1)
+        except Exception as e:
+            logger.warning("DDG failed: %s", e)
+        return None
+
     # ---------- Главный метод ----------
 
     async def find(
@@ -295,5 +380,23 @@ class TrailerFinder:
                 return yt_id
         except Exception as e:
             logger.warning("Piped stage failed: %s", e)
+
+        # 4. Invidious — другой набор инстансов
+        try:
+            yt_id = await self.from_invidious(title=title, year=year)
+            if yt_id:
+                logger.info("Trailer for %s via Invidious: %s", title, yt_id)
+                return yt_id
+        except Exception as e:
+            logger.warning("Invidious stage failed: %s", e)
+
+        # 5. DuckDuckGo HTML search (последняя попытка получить точный videoId)
+        try:
+            yt_id = await self.from_duckduckgo(title=title, year=year)
+            if yt_id:
+                logger.info("Trailer for %s via DuckDuckGo: %s", title, yt_id)
+                return yt_id
+        except Exception as e:
+            logger.warning("DuckDuckGo stage failed: %s", e)
 
         return None
