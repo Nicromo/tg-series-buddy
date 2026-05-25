@@ -95,9 +95,101 @@ def _init_sentry() -> None:
         logging.warning("Sentry init failed: %s", e)
 
 
+_ERROR_HINTS: dict[str, str] = {
+    # Telegram API errors — частые причины + что чинить
+    "BUTTON_DATA_INVALID":
+        "callback_data > 64 байт или не-ASCII. Сократи slug или замени кириллицу.",
+    "MESSAGE_NOT_MODIFIED":
+        "edit_text с тем же текстом+разметкой. Игнорируй или меняй контент.",
+    "MESSAGE_TO_EDIT_NOT_FOUND":
+        "Сообщение уже удалено или старше 48 ч. Шли новое вместо edit.",
+    "MESSAGE_TO_DELETE_NOT_FOUND":
+        "Сообщение уже удалено. Оберни delete_message в try/except.",
+    "MESSAGE_CANT_BE_DELETED":
+        "Сообщение нельзя удалить (старше 48 ч / не от бота).",
+    "QUERY_ID_INVALID":
+        "callback_query устарел (>15 сек). Отвечай быстрее или игнорируй.",
+    "WEBHOOK_REQUIRE_HTTPS":
+        "Webhook URL должен быть https.",
+    "Bad Request: can't parse entities":
+        "HTML/Markdown сломан — спецсимволы в тексте. html.escape() поможет.",
+    "Bad Request: chat not found":
+        "Юзер удалил чат или заблокировал бота.",
+    "Bad Request: message is too long":
+        "Сообщение > 4096 символов. Режь на части.",
+    "Forbidden: bot was blocked by the user":
+        "Юзер заблокировал бота. Можно пометить в БД и не слать.",
+    "Forbidden: bot is not a member":
+        "Бот не в чате/канале. Пригласи или сними команду.",
+    "Too Many Requests":
+        "Rate limit Telegram. Жди retry_after сек.",
+    # SQLAlchemy / DB
+    "asyncpg.exceptions.UndefinedColumnError":
+        "Колонка в БД отсутствует. Проверь миграции в repository.init_db().",
+    "asyncpg.exceptions.UniqueViolationError":
+        "Дубликат уникального ключа. Проверь логику upsert.",
+    "asyncpg.exceptions.ConnectionDoesNotExistError":
+        "Соединение с Neon отвалилось. Pool вернёт новое.",
+    # HTTP
+    "httpx.ConnectError":
+        "Не достучаться до апстрима (KP / Groq / YouTube). Проверь сеть и URL.",
+    "httpx.ReadTimeout":
+        "Апстрим не ответил вовремя. Увеличь timeout или ретрай.",
+    "httpx.HTTPStatusError":
+        "Апстрим вернул 4xx/5xx — проверь параметры запроса.",
+    # Python typical
+    "AttributeError: 'NoneType'":
+        "Где-то None вместо объекта. Добавь проверку или .get().",
+    "KeyError":
+        "Ключ отсутствует в dict. Используй .get() с дефолтом.",
+    "IndexError":
+        "Индекс за пределами списка. Проверь длину перед обращением.",
+    "TypeError":
+        "Несовместимые типы. Проверь сигнатуру функции.",
+    "ValueError":
+        "Невалидное значение. Проверь конвертацию (int/float/split).",
+}
+
+
+def _humanize_error(exc: BaseException) -> tuple[str, str | None]:
+    """Возвращает (короткая суть, подсказка-причина) для типичных ошибок."""
+    exc_name = type(exc).__name__
+    msg = str(exc)
+    full = f"{exc_name}: {msg}"
+    # 1. Точные совпадения по подстрокам
+    for needle, hint in _ERROR_HINTS.items():
+        if needle in full:
+            return f"{exc_name}: {msg.splitlines()[0][:200]}", hint
+    return f"{exc_name}: {msg.splitlines()[0][:200] if msg else '(без сообщения)'}", None
+
+
+def _describe_update(update) -> str:
+    """Короткая шапка: какой апдейт, от кого, в каком чате, что внутри."""
+    if update is None:
+        return "—"
+    parts: list[str] = []
+    try:
+        if getattr(update, "message", None):
+            m = update.message
+            who = m.from_user.username or m.from_user.full_name if m.from_user else "?"
+            text = (m.text or m.caption or f"[{m.content_type}]")[:80]
+            parts.append(f"message от @{who} (chat={m.chat.id}): {text!r}")
+        elif getattr(update, "callback_query", None):
+            cb = update.callback_query
+            who = cb.from_user.username or cb.from_user.full_name if cb.from_user else "?"
+            parts.append(f"callback от @{who}: data={cb.data!r}")
+        elif getattr(update, "pre_checkout_query", None):
+            parts.append("pre_checkout_query")
+        else:
+            parts.append(f"update_id={update.update_id}")
+    except Exception:
+        parts.append("(не удалось распарсить update)")
+    return " | ".join(parts)
+
+
 def _setup_owner_alert(dp: Dispatcher, bot: Bot) -> None:
     """Если задан OWNER_TG_ID — при unhandled exception в handler'е
-    шлём владельцу сообщение со stacktrace.
+    шлём владельцу человекочитаемое сообщение с сутью + контекстом + traceback.
     """
     owner_raw = os.getenv("OWNER_TG_ID", "").strip()
     if not owner_raw or not owner_raw.isdigit():
@@ -106,20 +198,55 @@ def _setup_owner_alert(dp: Dispatcher, bot: Bot) -> None:
 
     @dp.errors()
     async def _on_error(event) -> bool:
-        logging.exception("Unhandled error: %s", event.exception)
-        import traceback
-        tb = "".join(traceback.format_exception(type(event.exception), event.exception, event.exception.__traceback__))
-        # Telegram message max 4096 — обрезаем
-        if len(tb) > 3500:
-            tb = tb[:3500] + "\n…(обрезано)"
+        import html
+        import traceback as tb_mod
+
+        exc = event.exception
+        update = getattr(event, "update", None)
+        logging.exception("Unhandled error: %s", exc)
+
+        summary, hint = _humanize_error(exc)
+        ctx = _describe_update(update)
+
+        # Где в нашем коде упало (последний кадр из bot/)
+        tb_frames = tb_mod.extract_tb(exc.__traceback__)
+        our_frames = [f for f in tb_frames if "/bot/" in f.filename or "\\bot\\" in f.filename]
+        last = our_frames[-1] if our_frames else (tb_frames[-1] if tb_frames else None)
+        where = ""
+        if last:
+            short_file = last.filename.split("/bot/")[-1].split("\\bot\\")[-1]
+            where = f"📍 <b>bot/{html.escape(short_file)}:{last.lineno}</b> in <code>{html.escape(last.name)}()</code>\n"
+
+        # Полный traceback (для копания) — компактно, обрезаем по 3000 символов
+        full_tb = "".join(tb_mod.format_exception(type(exc), exc, exc.__traceback__))
+        if len(full_tb) > 2800:
+            # Оставляем первые 700 + последние 2100 — там обычно суть
+            full_tb = full_tb[:700] + "\n…(середина обрезана)…\n" + full_tb[-2100:]
+
+        hint_block = f"💡 <b>Причина:</b> {html.escape(hint)}\n" if hint else ""
+
+        text = (
+            "🚨 <b>Ошибка в боте</b>\n\n"
+            f"<b>Что:</b> <code>{html.escape(summary)}</code>\n"
+            f"{where}"
+            f"<b>Контекст:</b> {html.escape(ctx)}\n"
+            f"{hint_block}"
+            f"\n<b>Traceback:</b>\n<pre>{html.escape(full_tb)}</pre>"
+        )
+        # Telegram message max 4096
+        if len(text) > 4000:
+            text = text[:3950] + "\n…(обрезано)</pre>"
+
         try:
-            await bot.send_message(
-                owner_id,
-                f"🚨 <b>Ошибка в боте</b>\n<pre>{tb}</pre>",
-                parse_mode="HTML",
-            )
+            await bot.send_message(owner_id, text, parse_mode="HTML")
         except Exception as e:
             logging.warning("Owner alert failed: %s", e)
+            # Фоллбек — без HTML, plain
+            try:
+                plain = f"🚨 Ошибка: {summary}\nГде: {where}\nКонтекст: {ctx}"
+                await bot.send_message(owner_id, plain[:4000])
+            except Exception:
+                pass
         return True  # помечаем как обработанную, чтобы aiogram не валил выше
 
     logging.info("Owner alert wired for TG id %s", owner_id)
