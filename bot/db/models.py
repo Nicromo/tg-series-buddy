@@ -81,6 +81,28 @@ class Series(Base):
     added_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class YoutubeSubscription(Base):
+    """Подписка на YouTube-канал. Общая для пары (если есть pair_id),
+    иначе личная (привязка к user_id).
+    """
+
+    __tablename__ = "youtube_subscriptions"
+    __table_args__ = (
+        UniqueConstraint("pair_id", "user_id", "channel_id", name="uq_yt_sub"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Одно из двух будет заполнено — pair_id если в паре, иначе user_id
+    pair_id: Mapped[Optional[int]] = mapped_column(ForeignKey("pairs.id"), nullable=True, index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+
+    channel_id: Mapped[str] = mapped_column(String(32), index=True)
+    channel_title: Mapped[str] = mapped_column(String(256))
+    # videoId последнего отправленного юзеру видео — чтобы не дублировать
+    last_video_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class UserSeries(Base):
     """user <-> series association with status and rating.
 

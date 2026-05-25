@@ -15,8 +15,9 @@ from aiogram.types import (
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ..db import repository as repo
-from ..db.models import Pair, Series
+from ..db.models import Pair, Series, YoutubeSubscription
 from ..keyboards.main_menu import main_menu
+from ..services.youtube_rss import resolve_channel, fetch_latest_videos
 
 
 class JoinPairFSM(StatesGroup):
@@ -52,6 +53,9 @@ HELP_TEXT = (
     "/swipe — игровой режим: Tinder для сериалов\n\n"
     "<b>👫 Пара:</b>\n"
     "/pair — связаться с партнёром / показать статус пары\n\n"
+    "<b>📺 YouTube подписки:</b>\n"
+    "/sub &lt;url или @handle&gt; — подписаться на канал\n"
+    "/subs — список подписок (общий с партнёром)\n\n"
     "<b>📊 Прочее:</b>\n"
     "/stats — статистика\n"
     "/checkin — спросить про активные сейчас\n"
@@ -267,6 +271,109 @@ def make_router(session_factory: async_sessionmaker) -> Router:
             + extra,
             parse_mode="HTML",
         )
+
+    # ---------- YouTube подписки ----------
+
+    @router.message(Command("sub"))
+    async def cmd_sub(message: Message) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer(
+                "📺 <b>Подписка на YouTube-канал</b>\n\n"
+                "Пришли ссылку или @handle:\n"
+                "<code>/sub https://www.youtube.com/@MrBeast</code>\n"
+                "<code>/sub @kinopoisk</code>\n"
+                "<code>/sub https://www.youtube.com/channel/UCxxx</code>\n\n"
+                "Бот будет пушить новые видео.\n"
+                "Список подписок: /subs",
+                parse_mode="HTML",
+            )
+            return
+        url_or_handle = parts[1].strip()
+        await message.bot.send_chat_action(message.chat.id, action="typing")
+        info = await resolve_channel(url_or_handle)
+        if not info:
+            await message.answer(
+                "❌ Не нашёл такой канал. Проверь ссылку или попробуй /sub @handle",
+            )
+            return
+        # Помечаем последнее видео сразу — чтобы при подписке не получить
+        # «вышло X видео» пачкой за день назад
+        latest = await fetch_latest_videos(info.channel_id, limit=1)
+        last_vid_id = latest[0].video_id if latest else None
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            sub, created = await repo.add_youtube_subscription(
+                session, user, info.channel_id, info.title,
+            )
+            if created and last_vid_id:
+                await repo.mark_youtube_video_sent(session, sub.id, last_vid_id)
+            await session.commit()
+        scope = "вам с партнёром" if user.pair_id else "тебе"
+        if created:
+            await message.answer(
+                f"✅ Подписался на <b>{info.title}</b>.\n"
+                f"Буду присылать новые видео {scope}. /subs — список.",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                f"💡 <b>{info.title}</b> уже в подписках. /subs — список.",
+                parse_mode="HTML",
+            )
+
+    @router.message(Command("subs"))
+    async def cmd_subs(message: Message) -> None:
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            subs = await repo.list_youtube_subscriptions(session, user)
+        if not subs:
+            await message.answer(
+                "📺 Подписок пока нет.\n"
+                "Добавь канал: <code>/sub @handle</code> или /sub &lt;url&gt;",
+                parse_mode="HTML",
+            )
+            return
+        lines = [f"📺 <b>YouTube подписки ({len(subs)}):</b>", ""]
+        rows = []
+        for i, s in enumerate(subs, 1):
+            lines.append(
+                f"{i}. <a href=\"https://www.youtube.com/channel/{s.channel_id}\">"
+                f"{s.channel_title}</a>"
+            )
+            rows.append([InlineKeyboardButton(text=f"❌ {i}. Отписаться от {s.channel_title[:25]}", callback_data=f"ytunsub:{s.id}")])
+        lines.append("")
+        lines.append("<i>Жми ❌ чтобы отписаться</i>")
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            disable_web_page_preview=True,
+        )
+
+    @router.callback_query(F.data.startswith("ytunsub:"))
+    async def cb_yt_unsub(call: CallbackQuery) -> None:
+        sub_id = int(call.data.split(":")[1])
+        async with session_factory() as session:
+            sub = await session.get(YoutubeSubscription, sub_id)
+            title = sub.channel_title if sub else "канал"
+            removed = await repo.remove_youtube_subscription(session, sub_id)
+            await session.commit()
+        if removed:
+            await call.answer(f"❌ Отписался")
+            try:
+                await call.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await call.message.answer(f"❌ Отписался от <b>{title}</b>", parse_mode="HTML")
+        else:
+            await call.answer("Уже не было")
 
     # ---------- Кнопки главного меню (текстовые) → дёргают команды ----------
 

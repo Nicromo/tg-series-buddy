@@ -30,6 +30,7 @@ BOT_COMMANDS = [
     BotCommand(command="list",     description="📋 Наш общий список «хочу»"),
     BotCommand(command="watching", description="▶️ Смотрим сейчас"),
     BotCommand(command="pair",     description="👫 Связаться с партнёром"),
+    BotCommand(command="subs",     description="📺 YouTube подписки"),
     BotCommand(command="suggest",  description="🪄 Подбор от ИИ"),
     BotCommand(command="swipe",    description="🃏 Свайп-вечер"),
     BotCommand(command="stats",    description="📊 Статистика"),

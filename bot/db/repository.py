@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from .models import Base, Pair, Series, User, UserSeries, utcnow
+from .models import Base, Pair, Series, User, UserSeries, YoutubeSubscription, utcnow
 
 
 def make_engine(db_url: str):
@@ -311,6 +311,86 @@ async def list_release_subscribers(session: AsyncSession) -> list[tuple[int, Ser
     )
     rows = (await session.execute(stmt)).all()
     return [(uid, s) for uid, s in rows]
+
+
+# ---------- YouTube subscriptions ----------
+
+async def add_youtube_subscription(
+    session: AsyncSession, user: User, channel_id: str, channel_title: str
+) -> tuple[YoutubeSubscription, bool]:
+    """Добавить подписку (общую для пары если есть pair_id, иначе личную).
+    Возвращает (sub, created). created=False если уже была.
+    """
+    if user.pair_id:
+        result = await session.execute(
+            select(YoutubeSubscription).where(
+                YoutubeSubscription.pair_id == user.pair_id,
+                YoutubeSubscription.channel_id == channel_id,
+            )
+        )
+    else:
+        result = await session.execute(
+            select(YoutubeSubscription).where(
+                YoutubeSubscription.user_id == user.id,
+                YoutubeSubscription.pair_id.is_(None),
+                YoutubeSubscription.channel_id == channel_id,
+            )
+        )
+    existing = result.scalar_one_or_none()
+    if existing:
+        # Обновим название на свежее
+        existing.channel_title = channel_title
+        await session.flush()
+        return existing, False
+    sub = YoutubeSubscription(
+        pair_id=user.pair_id,
+        user_id=None if user.pair_id else user.id,
+        channel_id=channel_id,
+        channel_title=channel_title,
+    )
+    session.add(sub)
+    await session.flush()
+    return sub, True
+
+
+async def list_youtube_subscriptions(session: AsyncSession, user: User) -> list[YoutubeSubscription]:
+    if user.pair_id:
+        result = await session.execute(
+            select(YoutubeSubscription).where(YoutubeSubscription.pair_id == user.pair_id)
+            .order_by(YoutubeSubscription.created_at)
+        )
+    else:
+        result = await session.execute(
+            select(YoutubeSubscription).where(
+                YoutubeSubscription.user_id == user.id,
+                YoutubeSubscription.pair_id.is_(None),
+            ).order_by(YoutubeSubscription.created_at)
+        )
+    return list(result.scalars().all())
+
+
+async def remove_youtube_subscription(session: AsyncSession, sub_id: int) -> bool:
+    sub = await session.get(YoutubeSubscription, sub_id)
+    if sub is None:
+        return False
+    await session.delete(sub)
+    await session.flush()
+    return True
+
+
+async def list_all_youtube_subscriptions(session: AsyncSession) -> list[YoutubeSubscription]:
+    """Все подписки в системе — для scheduler-проверки."""
+    result = await session.execute(select(YoutubeSubscription))
+    return list(result.scalars().all())
+
+
+async def mark_youtube_video_sent(
+    session: AsyncSession, sub_id: int, video_id: str
+) -> None:
+    sub = await session.get(YoutubeSubscription, sub_id)
+    if sub:
+        sub.last_video_id = video_id
+        await session.flush()
 
 
 async def mark_checkin_sent(
