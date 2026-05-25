@@ -360,6 +360,32 @@ def make_router(
                 ]]),
             )
 
+    @router.callback_query(F.data.startswith("notify:"))
+    async def cb_notify_toggle(call: CallbackQuery) -> None:
+        series_id = int(call.data.split(":")[1])
+        async with session_factory() as session:
+            await repo.get_or_create_user(
+                session, tg_id=call.from_user.id,
+                username=call.from_user.username, full_name=call.from_user.full_name,
+            )
+            new_state = await repo.toggle_notify_releases(session, call.from_user.id, series_id)
+            series = await session.get(Series, series_id)
+            await session.commit()
+        title = series.title_ru if series else "сериал"
+        if new_state:
+            await call.answer("🔔 Включил уведомления")
+            await call.message.answer(
+                f"🔔 Подписался на новости по <b>{title}</b>.\n"
+                f"Дам знать когда выйдет новый сезон или фильм в прокат.",
+                parse_mode="HTML",
+            )
+        else:
+            await call.answer("🔕 Выключил уведомления")
+            await call.message.answer(
+                f"🔕 Больше не буду писать про <b>{title}</b>.",
+                parse_mode="HTML",
+            )
+
     @router.callback_query(F.data.startswith("rm:"))
     async def cb_remove(call: CallbackQuery) -> None:
         series_id = int(call.data.split(":")[1])
@@ -1195,6 +1221,7 @@ def make_router(
             user_status=us.status if us else None,
             user_rating=us.rating if us else None,
             note=us.notes if us else None,
+            notify_releases=bool(us and us.notify_releases),
         )
 
     @router.callback_query(F.data.startswith("open_random:"))
@@ -1210,6 +1237,7 @@ def make_router(
         await _send_card(
             call.bot, call.message.chat.id, series,
             user_status=us.status, user_rating=us.rating, note=us.notes,
+            notify_releases=bool(us.notify_releases),
         )
 
     # ============== Bulk-перевод статусов ==============

@@ -7,6 +7,7 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -71,6 +72,10 @@ class Series(Base):
     # JSON список [{name, url}] — где смотреть
     watch_options_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Премьеры — храним как DD.MM.YYYY строки, проще сравнивать с KP.
+    premiere_world: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    premiere_russia: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+
     added_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -98,5 +103,8 @@ class UserSeries(Base):
 
     # When we last sent the weekly check-in for this series (to avoid spam).
     last_checkin_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
+
+    # Подписка: уведомлять о новых сезонах / премьере. По умолчанию выключено.
+    notify_releases: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)

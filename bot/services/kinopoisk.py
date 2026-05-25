@@ -59,6 +59,10 @@ class KPDetails:
     imdb_id: Optional[str] = None  # формат "tt1234567"
     tmdb_id: Optional[int] = None
 
+    # Премьеры (ISO даты как строки, нормализованные в DD.MM.YYYY)
+    premiere_world: Optional[str] = None
+    premiere_russia: Optional[str] = None
+
     @property
     def best_trailer_youtube_id(self) -> Optional[str]:
         """Извлекаем YouTube-id из первой подходящей ссылки."""
@@ -244,6 +248,21 @@ class KinopoiskClient:
         tmdb_id_raw = ext.get("tmdb")
         tmdb_id = int(tmdb_id_raw) if tmdb_id_raw else None
 
+        # Премьеры
+        prem = d.get("premiere") or {}
+        def _fmt_date(iso: Optional[str]) -> Optional[str]:
+            """Преобразует ISO дату вида '2024-01-17T00:00:00.000Z' в '17.01.2024'."""
+            if not iso:
+                return None
+            try:
+                core = iso[:10]  # YYYY-MM-DD
+                y, m, dd = core.split("-")
+                return f"{dd}.{m}.{y}"
+            except Exception:
+                return None
+        premiere_world = _fmt_date(prem.get("world"))
+        premiere_russia = _fmt_date(prem.get("russia"))
+
         watch_options_raw = ((d.get("watchability") or {}).get("items") or [])
         watch_options = []
         for w in watch_options_raw[:6]:
@@ -270,4 +289,6 @@ class KinopoiskClient:
             watch_options=watch_options,
             imdb_id=imdb_id,
             tmdb_id=tmdb_id,
+            premiere_world=premiere_world,
+            premiere_russia=premiere_russia,
         )

@@ -37,6 +37,9 @@ async def init_db(engine) -> None:
         for sql in [
             "ALTER TABLE user_series ADD COLUMN IF NOT EXISTS last_checkin_at TIMESTAMP",
             "ALTER TABLE series ADD COLUMN IF NOT EXISTS watch_options_json TEXT",
+            "ALTER TABLE user_series ADD COLUMN IF NOT EXISTS notify_releases BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE series ADD COLUMN IF NOT EXISTS premiere_world VARCHAR(16)",
+            "ALTER TABLE series ADD COLUMN IF NOT EXISTS premiere_russia VARCHAR(16)",
         ]:
             try:
                 await conn.exec_driver_sql(sql)
@@ -192,6 +195,34 @@ async def clear_user_series_rating(
     us.rating = None
     await session.flush()
     return True
+
+
+async def toggle_notify_releases(
+    session: AsyncSession, user_id: int, series_id: int
+) -> bool:
+    """Включает/выключает подписку на новые сезоны/премьеру. Возвращает
+    новое состояние. Создаёт UserSeries если ещё нет (с status=want).
+    """
+    us = await get_user_series(session, user_id, series_id)
+    if us is None:
+        us = UserSeries(user_id=user_id, series_id=series_id, status="want", notify_releases=True)
+        session.add(us)
+        await session.flush()
+        return True
+    us.notify_releases = not bool(us.notify_releases)
+    await session.flush()
+    return bool(us.notify_releases)
+
+
+async def list_release_subscribers(session: AsyncSession) -> list[tuple[int, Series]]:
+    """Список (user_id, Series) для всех подписанных на уведомления."""
+    stmt = (
+        select(UserSeries.user_id, Series)
+        .join(Series, UserSeries.series_id == Series.id)
+        .where(UserSeries.notify_releases.is_(True))
+    )
+    rows = (await session.execute(stmt)).all()
+    return [(uid, s) for uid, s in rows]
 
 
 async def mark_checkin_sent(

@@ -89,6 +89,17 @@ def format_caption(
     if meta_bits:
         lines.append(" • ".join(meta_bits))
 
+    # Премьеры — показываем если есть в БД
+    prem_w = getattr(s, "premiere_world", None)
+    prem_r = getattr(s, "premiere_russia", None)
+    if prem_w or prem_r:
+        bits = []
+        if prem_r:
+            bits.append(f"🇷🇺 {prem_r}")
+        if prem_w and prem_w != prem_r:
+            bits.append(f"🌍 {prem_w}")
+        lines.append("📅 Премьера: " + " · ".join(bits))
+
     if s.genres:
         lines.append(f"🎭 {s.genres}")
 
@@ -132,6 +143,7 @@ async def send_card(
     user_status: Optional[str] = None,
     user_rating: Optional[str] = None,
     note: Optional[str] = None,
+    notify_releases: bool = False,
 ) -> None:
     caption = format_caption(series, status=user_status, rating=user_rating, note=note)
     # «В списках» = есть хоть какая-то связь с сериалом (статус/оценка/заметка)
@@ -141,6 +153,7 @@ async def send_card(
         has_trailer=bool(series.trailer_youtube_id or series.trailer_file_id),
         is_watched=user_status == "watched",
         is_in_list=in_list,
+        notify_releases=notify_releases,
     )
     if series.poster_url:
         try:
@@ -174,6 +187,8 @@ def details_to_series_dict(d: KPDetails) -> dict:
         "trailer_youtube_id": d.best_trailer_youtube_id,
         "trailer_language": d.best_trailer_language,
         "watch_options_json": json.dumps(d.watch_options) if d.watch_options else None,
+        "premiere_world": d.premiere_world,
+        "premiere_russia": d.premiere_russia,
     }
 
 
@@ -241,7 +256,12 @@ async def add_by_kp_id(
             f"✅ <b>{series.title_ru}</b> добавлен в «👀 Хочу посмотреть»{suffix}",
             parse_mode="HTML",
         )
-    await send_card(bot, chat_id, series, user_status=status, user_rating=rating, note=note)
+    notify = bool(us and us.notify_releases) if us else False
+    await send_card(
+        bot, chat_id, series,
+        user_status=status, user_rating=rating, note=note,
+        notify_releases=notify,
+    )
 
 
 async def send_suggestions_gallery(
