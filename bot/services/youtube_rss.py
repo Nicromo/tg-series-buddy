@@ -100,6 +100,13 @@ async def resolve_channel(url_or_handle: str) -> Optional[ChannelInfo]:
 async def _resolve_handle(handle: str) -> Optional[ChannelInfo]:
     """@handle → channel_id через парсинг HTML страницы канала.
     Title берём из RSS feed (там UTF-8 в чистом виде, без HTML/JSON escape).
+
+    Защита от «не того канала»: YouTube вставляет на страницу channelId
+    рекомендуемых каналов раньше основного. Поэтому:
+    1. Сначала пробуем og:url meta (всегда главный канал).
+    2. Потом «externalId» (это основной, рекомендации идут через channelId).
+    3. Если и это пусто — берём САМЫЙ ЧАСТЫЙ channel_id на странице
+       (основной канал упоминается десятки раз).
     """
     url = f"https://www.youtube.com/{handle}"
     headers = {"User-Agent": _UA, "Cookie": _CONSENT_COOKIE, "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"}
@@ -110,17 +117,35 @@ async def _resolve_handle(handle: str) -> Optional[ChannelInfo]:
                 logger.info("YT handle resolve %s: status %s", handle, r.status_code)
                 return None
             html = r.text
-            patterns = [
-                r'"channelId":"(UC[A-Za-z0-9_-]{22})"',
-                r'"externalId":"(UC[A-Za-z0-9_-]{22})"',
-                r'/channel/(UC[A-Za-z0-9_-]{22})',
-            ]
             ch_id: Optional[str] = None
-            for p in patterns:
-                m = re.search(p, html)
+
+            # 1) og:url наиболее надёжно — содержит canonical URL канала
+            m = re.search(r'<meta property="og:url" content="https://www\.youtube\.com/channel/(UC[A-Za-z0-9_-]{22})"', html)
+            if m:
+                ch_id = m.group(1)
+            # 2) externalId в JSON — основной канал
+            if not ch_id:
+                m = re.search(r'"externalId":"(UC[A-Za-z0-9_-]{22})"', html)
                 if m:
                     ch_id = m.group(1)
-                    break
+            # 3) canonical link
+            if not ch_id:
+                m = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[A-Za-z0-9_-]{22})"', html)
+                if m:
+                    ch_id = m.group(1)
+            # 4) Эвристика «самый частый channel_id» — основной канал
+            # упоминается сильно чаще рекомендованных
+            if not ch_id:
+                from collections import Counter
+                all_ids = re.findall(r'(UC[A-Za-z0-9_-]{22})', html)
+                if all_ids:
+                    ctr = Counter(all_ids)
+                    top_id, top_count = ctr.most_common(1)[0]
+                    # Берём только если он явно доминирует (хотя бы 5+ и в 3+ раза чаще второго)
+                    if top_count >= 5:
+                        second = ctr.most_common(2)[1][1] if len(ctr) > 1 else 0
+                        if top_count >= 3 * second or second == 0:
+                            ch_id = top_id
             if not ch_id:
                 return None
             # Title — берём через robust-fetch (RSS + HTML с og:title).
