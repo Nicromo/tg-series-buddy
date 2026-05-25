@@ -818,7 +818,22 @@ def make_router(
     # ============== Списки с пагинацией ==============
     async def _send_list(message: Message, status: str, empty_msg: str, *, header: str = "") -> None:
         async with session_factory() as session:
-            rows = await repo.list_user_series(session, message.from_user.id, status=status)
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            rows = await repo.list_user_series(session, user.id, status=status)
+            # Партнёрские рейтинги — для пометки «💛 любим оба»
+            partner_ratings: dict[int, str] = {}
+            if user.pair_id:
+                members = await repo.get_pair_members(session, user.pair_id)
+                for m in members:
+                    if m.id == user.id:
+                        continue
+                    p_rows = await repo.list_user_series(session, m.id, status=None)
+                    for p_us, p_s in p_rows:
+                        if p_us.rating:
+                            partner_ratings[p_s.id] = p_us.rating
         if not rows:
             await message.answer(empty_msg)
             return
@@ -837,11 +852,19 @@ def make_router(
         # Текст: заголовок + пронумерованный список
         title = header or "Список"
         lines = [f"{title}  ·  {len(rows)} шт.", ""]
+        both_liked_count = 0
         for i, (us, s) in enumerate(items, 1):
             marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
             year_str = f" ({s.year})" if s.year else ""
             rating_str = f" ⭐{s.rating_kp:.1f}" if s.rating_kp else ""
-            lines.append(f"{marker} <b>{s.title_ru}</b>{year_str}{rating_str}")
+            # «Любим оба» если у нас обоих rating=like
+            both_liked = us.rating == "like" and partner_ratings.get(s.id) == "like"
+            liked_emoji = " 💛" if both_liked else ""
+            if both_liked:
+                both_liked_count += 1
+            lines.append(f"{marker} <b>{s.title_ru}</b>{year_str}{rating_str}{liked_emoji}")
+        if both_liked_count and status == "want":
+            lines[0] += f"  ·  💛 {both_liked_count} любим оба"
         if len(rows) > 10:
             lines.append("")
             lines.append(f"<i>… показал первые 10 из {len(rows)}. /find для поиска.</i>")
@@ -879,7 +902,11 @@ def make_router(
 
     @router.message(Command("list"))
     async def cmd_list(message: Message) -> None:
-        await _send_list(message, "want", "Очередь пустая. Добавь /add &lt;название&gt;", header="👀 <b>Хочу посмотреть:</b>")
+        await _send_list(
+            message, "want",
+            "Очередь пустая. Добавь /add &lt;название&gt;",
+            header="👀 <b>Наш общий «хочу посмотреть»:</b>",
+        )
 
     @router.message(Command("watching"))
     async def cmd_watching(message: Message) -> None:
@@ -975,97 +1002,6 @@ def make_router(
         await message.answer(f"🔎 Нашёл ({len(matched)}):", parse_mode="HTML")
         for us, series in matched[:10]:
             await _send_card(message.bot, message.chat.id, series, user_status=us.status, user_rating=us.rating, note=us.notes)
-
-    # ============== /match ==============
-    @router.message(Command("match"))
-    async def cmd_match(message: Message) -> None:
-        async with session_factory() as session:
-            user = await repo.get_or_create_user(
-                session, tg_id=message.from_user.id,
-                username=message.from_user.username, full_name=message.from_user.full_name,
-            )
-            if not user.pair_id:
-                await message.answer(
-                    "👫 <b>Сначала свяжись с партнёром</b>\n\n"
-                    "Жми кнопку <b>👫 Пара</b> снизу (или команду /pair) — "
-                    "получишь инвайт-код. Перешли его жене/мужу — они напишут "
-                    "<code>/pair &lt;твой код&gt;</code>, и появятся общие лайки 💛",
-                    parse_mode="HTML",
-                )
-                return
-            matches = await repo.list_pair_matches(session, user.pair_id)
-        if not matches:
-            await message.answer(
-                "💛 <b>Пока нет общих лайков</b>\n\n"
-                "Лайкайте сериалы 👍 кнопкой под карточкой — когда вы "
-                "<i>оба</i> лайкнете один и тот же, он появится здесь.",
-                parse_mode="HTML",
-            )
-            return
-
-        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
-        items = matches[:10]
-
-        # Галерея постеров
-        media = [InputMediaPhoto(media=s.poster_url) for s in items if s.poster_url]
-        if len(media) >= 2:
-            try:
-                await message.bot.send_media_group(message.chat.id, media[:10])
-            except Exception as e:
-                logger.warning("send_media_group failed for /match: %s", e)
-
-        # Текст + кнопки
-        lines = [f"💛 <b>Лайкнули оба ({len(matches)}):</b>", ""]
-        for i, s in enumerate(items, 1):
-            marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
-            year_str = f" ({s.year})" if s.year else ""
-            rating_str = f" ⭐{s.rating_kp:.1f}" if s.rating_kp else ""
-            lines.append(f"{marker} <b>{s.title_ru}</b>{year_str}{rating_str}")
-        if len(matches) > 10:
-            lines.append("")
-            lines.append(f"<i>… показал первые 10 из {len(matches)}.</i>")
-        lines.append("")
-        lines.append("<i>👇 Жми номер чтобы открыть полную карточку</i>")
-
-        btn_rows: list[list] = []
-        cur: list = []
-        for i, s in enumerate(items, 1):
-            cur.append(IKB(text=f"👁 {i}", callback_data=f"open:{s.id}"))
-            if len(cur) >= 5:
-                btn_rows.append(cur)
-                cur = []
-        if cur:
-            btn_rows.append(cur)
-        btn_rows.append([IKB(text="🎲 Случайный из общих", callback_data="match_random:0")])
-
-        await message.answer(
-            "\n".join(lines),
-            parse_mode="HTML",
-            reply_markup=IKM(inline_keyboard=btn_rows),
-            disable_web_page_preview=True,
-        )
-
-    @router.callback_query(F.data.startswith("match_random:"))
-    async def cb_match_random(call: CallbackQuery) -> None:
-        async with session_factory() as session:
-            user = await repo.get_or_create_user(
-                session, tg_id=call.from_user.id,
-                username=call.from_user.username, full_name=call.from_user.full_name,
-            )
-            if not user.pair_id:
-                await call.answer("Нет пары")
-                return
-            matches = await repo.list_pair_matches(session, user.pair_id)
-        if not matches:
-            await call.answer("Нет общих лайков")
-            return
-        s = random.choice(matches)
-        await call.answer("Включаем! 🎬")
-        await _send_card(call.bot, call.message.chat.id, s)
-
-    @router.message(F.text == "💛 Лайки оба")
-    async def btn_match(message: Message) -> None:
-        await cmd_match(message)
 
     # ============== /stats ==============
     @router.message(Command("stats"))

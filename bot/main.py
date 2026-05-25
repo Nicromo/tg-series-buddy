@@ -27,9 +27,8 @@ from .services.scheduler import start_scheduler
 BOT_COMMANDS = [
     BotCommand(command="today",    description="🍿 Что смотреть сегодня"),
     BotCommand(command="add",      description="➕ Добавить сериал или фильм"),
-    BotCommand(command="list",     description="📋 Хочу посмотреть"),
+    BotCommand(command="list",     description="📋 Наш общий список «хочу»"),
     BotCommand(command="watching", description="▶️ Смотрим сейчас"),
-    BotCommand(command="match",    description="💛 Нравится обоим"),
     BotCommand(command="pair",     description="👫 Связаться с партнёром"),
     BotCommand(command="suggest",  description="🪄 Подбор от ИИ"),
     BotCommand(command="swipe",    description="🃏 Свайп-вечер"),
