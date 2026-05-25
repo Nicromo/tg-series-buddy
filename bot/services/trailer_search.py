@@ -362,6 +362,118 @@ class TrailerFinder:
                 logger.warning("DDG query failed (%s): %s", q[:50], e)
         return None
 
+    # ---------- Достать mp4 для send_video (встроенный плеер Telegram) ----------
+
+    async def fetch_video_bytes(
+        self,
+        youtube_id: str,
+        *,
+        max_mb: int = 45,
+        prefer_quality: tuple[str, ...] = ("480p", "360p", "240p", "720p"),
+    ) -> Optional[bytes]:
+        """Через Piped/Invidious /streams получить прямой mp4 URL и скачать
+        bytes (≤ max_mb). Можно отправить через send_video → играет в чате.
+
+        Возвращает None если ни один инстанс не отвечает, либо стрим > max_mb.
+        """
+        stream_url = await self._resolve_stream_url(youtube_id, prefer_quality)
+        if not stream_url:
+            return None
+        max_bytes = max_mb * 1024 * 1024
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0),
+                follow_redirects=True,
+                headers={"User-Agent": UA_BROWSER},
+            ) as c:
+                # Сначала HEAD (если поддерживается) — проверить размер
+                try:
+                    head = await c.head(stream_url)
+                    cl = head.headers.get("content-length")
+                    if cl and int(cl) > max_bytes:
+                        logger.info(
+                            "Stream %s too big (%s MB), skip download",
+                            youtube_id, int(cl) // 1024 // 1024,
+                        )
+                        return None
+                except Exception:
+                    pass  # HEAD не обязателен
+
+                # GET с потоком — обрываем если превысили лимит
+                async with c.stream("GET", stream_url) as resp:
+                    if resp.status_code != 200:
+                        logger.warning("Stream GET %s: %s", youtube_id, resp.status_code)
+                        return None
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_bytes():
+                        total += len(chunk)
+                        if total > max_bytes:
+                            logger.info("Stream %s exceeded %d MB during download", youtube_id, max_mb)
+                            return None
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+        except Exception as e:
+            logger.warning("fetch_video_bytes failed for %s: %s", youtube_id, e)
+            return None
+
+    async def _resolve_stream_url(
+        self, youtube_id: str, prefer_quality: tuple[str, ...]
+    ) -> Optional[str]:
+        """Перебирает Piped и Invidious инстансы, ищет mp4-URL подходящего качества."""
+        # 1) Piped: GET /streams/{id} → {"videoStreams": [...]}
+        async with httpx.AsyncClient(
+            timeout=self._timeout,
+            follow_redirects=True,
+            headers={"User-Agent": UA_BROWSER},
+        ) as c:
+            for inst in PIPED_INSTANCES:
+                try:
+                    r = await c.get(f"{inst}/streams/{youtube_id}")
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                    streams = data.get("videoStreams") or []
+                    # Только muxed (видео+аудио вместе), не videoOnly
+                    muxed = [
+                        s for s in streams
+                        if not s.get("videoOnly") and s.get("url")
+                        and (s.get("format") or "").upper().startswith("MPEG")
+                    ]
+                    if not muxed:
+                        # Fallback: любой не-videoOnly с url
+                        muxed = [s for s in streams if not s.get("videoOnly") and s.get("url")]
+                    for q in prefer_quality:
+                        for s in muxed:
+                            if s.get("quality") == q:
+                                return s["url"]
+                    # Если нет нужного качества — берём первый муxed
+                    if muxed:
+                        return muxed[0]["url"]
+                except Exception as e:
+                    logger.warning("Piped /streams %s failed: %s", inst, e)
+                    continue
+
+            # 2) Invidious: GET /api/v1/videos/{id} → {"formatStreams":[...]}
+            for inst in INVIDIOUS_INSTANCES:
+                try:
+                    r = await c.get(f"{inst}/api/v1/videos/{youtube_id}")
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                    # formatStreams — это уже muxed (видео+аудио вместе)
+                    fmts = data.get("formatStreams") or []
+                    for q in prefer_quality:
+                        for s in fmts:
+                            if s.get("qualityLabel") == q and s.get("url"):
+                                return s["url"]
+                    if fmts:
+                        return fmts[0].get("url")
+                except Exception as e:
+                    logger.warning("Invidious /videos %s failed: %s", inst, e)
+                    continue
+        return None
+
     # ---------- Главный метод ----------
 
     async def find(

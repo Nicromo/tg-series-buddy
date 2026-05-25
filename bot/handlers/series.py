@@ -423,6 +423,13 @@ def make_router(
             await call.answer("❌ Дропнул")
 
     # ============== Трейлер ==============
+    # Встроенный плеер Telegram (через скачивание mp4) выключен по умолчанию:
+    # публичные Piped/Invidious инстансы блокируют /streams для серверных IP.
+    # Включи через env INLINE_VIDEO_ENABLED=true когда поднимешь свой инстанс
+    # Piped или Cobalt с JWT-ключом.
+    import os as _os
+    _inline_video_enabled = _os.getenv("INLINE_VIDEO_ENABLED", "").lower() in ("1", "true", "yes")
+
     async def _send_trailer_message(chat_id: int, bot: Bot, title: str, youtube_url: str, *, only_english: bool) -> None:
         """Шлёт сообщение с YouTube URL и кнопкой «Открыть в YouTube»."""
         lines = [f"🎥 Трейлер · <b>{title}</b>"]
@@ -436,6 +443,42 @@ def make_router(
             disable_web_page_preview=False,
             reply_markup=trailer_link_keyboard(youtube_url),
         )
+
+    async def _try_send_inline_video(
+        chat_id: int, bot: Bot, *, title: str, youtube_id: str, only_english: bool,
+        series_id_for_cache: Optional[int] = None,
+    ) -> bool:
+        """Пытается скачать стрим через Piped/Invidious и отправить
+        через send_video (встроенный плеер Telegram). True если получилось."""
+        from aiogram.types import BufferedInputFile
+
+        await bot.send_chat_action(chat_id, action="upload_video")
+        video_bytes = await trailer_finder.fetch_video_bytes(youtube_id, max_mb=45)
+        if not video_bytes:
+            return False
+        try:
+            caption_lines = [f"🎥 Трейлер · {title}"]
+            if only_english:
+                caption_lines.append("🇬🇧 Только английский")
+            youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
+            msg = await bot.send_video(
+                chat_id=chat_id,
+                video=BufferedInputFile(video_bytes, filename=f"trailer_{youtube_id}.mp4"),
+                caption="\n".join(caption_lines),
+                supports_streaming=True,
+                reply_markup=trailer_link_keyboard(youtube_url),
+            )
+            # Кешируем file_id чтобы повторный клик был мгновенным
+            if series_id_for_cache and msg.video and msg.video.file_id:
+                async with session_factory() as session:
+                    s = await session.get(Series, series_id_for_cache)
+                    if s:
+                        s.trailer_file_id = msg.video.file_id
+                        await session.commit()
+            return True
+        except Exception as e:
+            logger.warning("send_video failed for yt=%s: %s", youtube_id, e)
+            return False
 
     @router.callback_query(F.data.startswith("tr:"))
     async def cb_trailer(call: CallbackQuery) -> None:
@@ -467,12 +510,18 @@ def make_router(
             trailer_lang = series.trailer_language
             kp_id = series.kp_id
 
-        # 1) Кешированный yt_id — мгновенно
+        # 1) Кешированный yt_id
         if yt_id:
+            only_en = bool(trailer_lang and trailer_lang != "ru")
+            if _inline_video_enabled and await _try_send_inline_video(
+                call.message.chat.id, call.bot,
+                title=title, youtube_id=yt_id, only_english=only_en,
+                series_id_for_cache=series_id,
+            ):
+                return
             url = f"https://www.youtube.com/watch?v={yt_id}"
             await _send_trailer_message(
-                call.message.chat.id, call.bot, title, url,
-                only_english=(trailer_lang and trailer_lang != "ru"),
+                call.message.chat.id, call.bot, title, url, only_english=only_en,
             )
             return
 
@@ -503,7 +552,7 @@ def make_router(
                 logger.exception("trailer_finder failed: %s", e)
 
         if yt_id:
-            # Кешируем для повторных кликов
+            # Кешируем yt_id для повторных кликов
             async with session_factory() as session:
                 s = await session.get(Series, series_id)
                 if s:
@@ -511,10 +560,16 @@ def make_router(
                     if trailer_lang:
                         s.trailer_language = trailer_lang
                     await session.commit()
+            only_en = bool(trailer_lang and trailer_lang != "ru")
+            if _inline_video_enabled and await _try_send_inline_video(
+                call.message.chat.id, call.bot,
+                title=title, youtube_id=yt_id, only_english=only_en,
+                series_id_for_cache=series_id,
+            ):
+                return
             url = f"https://www.youtube.com/watch?v={yt_id}"
             await _send_trailer_message(
-                call.message.chat.id, call.bot, title, url,
-                only_english=(trailer_lang and trailer_lang != "ru"),
+                call.message.chat.id, call.bot, title, url, only_english=only_en,
             )
             return
 
@@ -573,10 +628,15 @@ def make_router(
                 logger.warning("trailer_finder failed in trkp: %s", e)
 
         if yt_id:
+            only_en = bool(trailer_lang and trailer_lang != "ru")
+            if _inline_video_enabled and await _try_send_inline_video(
+                call.message.chat.id, call.bot,
+                title=title, youtube_id=yt_id, only_english=only_en,
+            ):
+                return
             url = f"https://www.youtube.com/watch?v={yt_id}"
             await _send_trailer_message(
-                call.message.chat.id, call.bot, title, url,
-                only_english=(trailer_lang and trailer_lang != "ru"),
+                call.message.chat.id, call.bot, title, url, only_english=only_en,
             )
             return
 
