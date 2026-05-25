@@ -1293,6 +1293,338 @@ def make_router(
         # Бывает что есть только watched/dropped — тогда ничего не показываем дополнительно
         await message.answer("Активных нет. Может что-то пересмотреть? 🔁")
 
+    # ============== /where — где смотреть из моих списков ==============
+    @router.message(Command("where"))
+    async def cmd_where(message: Message) -> None:
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            rows = await repo.list_user_series(session, user.id, status=None)
+
+        # Группируем по платформам
+        # watch_options_json: '[["КП HD", "https://..."], ...]'
+        active = [(us, s) for us, s in rows if us.status in ("want", "watching", "want_rewatch")]
+        platforms: dict[str, list[tuple]] = {}  # platform → [(title, status, url), ...]
+        no_data: list[str] = []
+        for us, s in active:
+            if not s.watch_options_json:
+                no_data.append(s.title_ru)
+                continue
+            try:
+                opts = json.loads(s.watch_options_json)
+            except Exception:
+                no_data.append(s.title_ru)
+                continue
+            if not opts:
+                no_data.append(s.title_ru)
+                continue
+            for name, url in opts[:5]:
+                platforms.setdefault(name, []).append((s.title_ru, us.status, url))
+
+        if not platforms and not no_data:
+            await message.answer(
+                "📺 В активных списках ничего нет. Добавь через /add 🎬",
+            )
+            return
+
+        # Сортируем платформы по количеству сериалов (топ-сверху)
+        sorted_platforms = sorted(platforms.items(), key=lambda x: -len(x[1]))
+
+        lines = [
+            f"📺 <b>Где смотреть ({len(active)} из активных):</b>",
+            "",
+        ]
+        for name, items in sorted_platforms[:8]:
+            lines.append(f"<b>{name}</b> · {len(items)} шт.")
+            for title, status, url in items[:6]:
+                status_emoji = {"want": "👀", "watching": "▶️", "want_rewatch": "🔁"}.get(status, "•")
+                lines.append(f"  {status_emoji} <a href=\"{url}\">{title}</a>")
+            if len(items) > 6:
+                lines.append(f"  <i>… и ещё {len(items) - 6}</i>")
+            lines.append("")
+        if no_data:
+            lines.append(f"<i>🤷 По {len(no_data)} нет инфы о платформах (KP не знает)</i>")
+        if len(sorted_platforms) > 8:
+            lines.append(f"<i>… ещё {len(sorted_platforms) - 8} платформ скрыто</i>")
+
+        text = "\n".join(lines)
+        if len(text) > 3900:
+            text = text[:3900] + "\n…(обрезано)"
+        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+
+    # ============== /poll — опрос «что включим сегодня» ==============
+    # In-memory хранилище опросов. Не persistent — но опросы коротко-живущие,
+    # переживать рестарт не требуется.
+    _polls: dict[str, dict] = {}
+
+    @router.message(Command("poll"))
+    async def cmd_poll(message: Message) -> None:
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            if not user.pair_id:
+                await message.answer(
+                    "📊 Опросы для пары. Сначала свяжись с партнёром: /pair",
+                )
+                return
+            members = await repo.get_pair_members(session, user.pair_id)
+            partner_ids = [m.id for m in members if m.id != user.id]
+            if not partner_ids:
+                await message.answer(
+                    "📊 В паре никого кроме тебя. Подожди пока партнёр присоединится через /pair.",
+                )
+                return
+            # Кандидаты: общий want + watching
+            rows = await repo.list_user_series(session, user.id, status=None)
+            candidates = [s for us, s in rows if us.status in ("want", "watching")]
+
+        if len(candidates) < 3:
+            await message.answer(
+                "📊 Нужно минимум 3 сериала в «👀 Хочу» / «▶️ Смотрю» чтобы провести опрос. "
+                "Добавь больше через /add 🎬",
+            )
+            return
+
+        chosen = random.sample(candidates, 3)
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        # Сохраняем опрос
+        import secrets as _secrets
+        poll_id = _secrets.token_urlsafe(6)
+        _polls[poll_id] = {
+            "options": [(s.id, s.title_ru, s.year) for s in chosen],
+            "votes": {},  # user_id → option_idx
+            "participants": {user.id, *partner_ids},
+            "initiator_name": message.from_user.full_name or message.from_user.username or "Партнёр",
+        }
+
+        kb_rows = [
+            [IKB(
+                text=f"{i+1}. {title}" + (f" ({year})" if year else ""),
+                callback_data=f"pollv:{poll_id}:{i}",
+            )]
+            for i, (sid, title, year) in enumerate(_polls[poll_id]["options"])
+        ]
+        body = (
+            f"📊 <b>Что включим сегодня?</b>\n"
+            f"Голосуйте оба — бот покажет совпадение."
+        )
+        # Шлём обоим
+        await message.answer(body, parse_mode="HTML", reply_markup=IKM(inline_keyboard=kb_rows))
+        for pid in partner_ids:
+            try:
+                await message.bot.send_message(
+                    chat_id=pid,
+                    text=f"📊 <b>{_polls[poll_id]['initiator_name']}</b> предлагает выбрать что включить:\n"
+                         f"Голосуй ниже — бот покажет совпадение.",
+                    parse_mode="HTML",
+                    reply_markup=IKM(inline_keyboard=kb_rows),
+                )
+            except Exception as e:
+                logger.warning("Poll invite to %s failed: %s", pid, e)
+                await message.answer(f"⚠️ Не смог написать партнёру (он не открывал бота?). ID {pid}")
+
+    @router.callback_query(F.data.startswith("pollv:"))
+    async def cb_poll_vote(call: CallbackQuery) -> None:
+        _, poll_id, opt_idx_s = call.data.split(":")
+        opt_idx = int(opt_idx_s)
+        poll = _polls.get(poll_id)
+        if not poll:
+            await call.answer("Опрос уже закрыт. Создай новый: /poll", show_alert=True)
+            try:
+                await call.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        if call.from_user.id not in poll["participants"]:
+            await call.answer("Этот опрос не для тебя.", show_alert=True)
+            return
+
+        poll["votes"][call.from_user.id] = opt_idx
+        title = poll["options"][opt_idx][1]
+        await call.answer(f"✅ Голос: {title}")
+
+        # Все ли проголосовали?
+        if len(poll["votes"]) >= len(poll["participants"]):
+            votes_list = list(poll["votes"].values())
+            if len(set(votes_list)) == 1:
+                # Совпало!
+                winner = poll["options"][votes_list[0]]
+                title, year = winner[1], winner[2]
+                year_str = f" ({year})" if year else ""
+                msg = f"🎉 <b>Решили вместе:</b>\n🎬 <b>{title}</b>{year_str}\n\nХорошего вечера 🍿"
+            else:
+                opts_text = "\n".join(
+                    f"  • {poll['options'][i][1]}" for i in votes_list
+                )
+                msg = (
+                    f"🤔 <b>Не совпало</b>\n"
+                    f"Голоса:\n{opts_text}\n\n"
+                    f"Можно проголосовать ещё раз или /poll для новых вариантов."
+                )
+            # Шлём результат всем участникам
+            for uid in poll["participants"]:
+                try:
+                    await call.bot.send_message(chat_id=uid, text=msg, parse_mode="HTML")
+                except Exception:
+                    pass
+            # Чистим
+            _polls.pop(poll_id, None)
+
+    # ============== /upcoming — премьеры под жанры пары ==============
+    @router.message(Command("upcoming"))
+    async def cmd_upcoming(message: Message) -> None:
+        await message.bot.send_chat_action(message.chat.id, action="typing")
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            all_rows = await repo.list_user_series(session, user.id, status=None)
+            if user.pair_id:
+                members = await repo.get_pair_members(session, user.pair_id)
+                for m in members:
+                    if m.id != user.id:
+                        all_rows.extend(await repo.list_user_series(session, m.id, status=None))
+            known_kp_ids = {s.kp_id for _, s in all_rows}
+            gc: Counter = Counter()
+            for us, s in all_rows:
+                if us.status != "dropped" and s.genres:
+                    for g in s.genres.split(","):
+                        g = g.strip()
+                        if g:
+                            gc[g] += 1
+            top_genres = [g for g, _ in gc.most_common(3)]
+
+        try:
+            if top_genres:
+                hits = await kp.get_upcoming_series(genres=top_genres, limit=25)
+            else:
+                hits = await kp.get_upcoming_series(limit=25)
+        except Exception as e:
+            await message.answer(f"😕 KP заглох: {e}")
+            return
+        fresh = [h for h in hits if h.kp_id not in known_kp_ids][:10]
+        if not fresh:
+            await message.answer(
+                "📅 Не нашёл новых премьер под ваши жанры.\n"
+                "Попробуй позже или /swipe для случайных предложений.",
+            )
+            return
+
+        genres_hint = f" по жанрам: <i>{', '.join(top_genres)}</i>" if top_genres else ""
+        lines = [f"📅 <b>Премьеры под вас{genres_hint}:</b>", ""]
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        for i, h in enumerate(fresh, 1):
+            year_str = f" ({h.year})" if h.year else ""
+            rating_str = f" ⭐{h.rating_kp:.1f}" if h.rating_kp else ""
+            marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
+            lines.append(f"{marker} <b>{h.title_ru}</b>{year_str}{rating_str}")
+        # media_group из постеров
+        media = [InputMediaPhoto(media=h.poster_url) for h in fresh if h.poster_url]
+        if len(media) >= 2:
+            try:
+                await message.bot.send_media_group(message.chat.id, media[:10])
+            except Exception as e:
+                logger.warning("send_media_group failed for /upcoming: %s", e)
+
+        # Один ряд кнопок «➕ Добавить» под каждым (компактно — по 2 в ряд)
+        rows: list[list] = []
+        cur: list = []
+        for i, h in enumerate(fresh, 1):
+            short = h.title_ru[:18] + "…" if len(h.title_ru) > 18 else h.title_ru
+            cur.append(IKB(text=f"➕ {i}. {short}", callback_data=f"addkp:{h.kp_id}"))
+            if len(cur) >= 2:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=rows),
+            disable_web_page_preview=True,
+        )
+
+    # ============== /top <жанр> — топ-10 по жанру ==============
+    @router.message(Command("top"))
+    async def cmd_top(message: Message) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer(
+                "📊 Напиши жанр: <code>/top драма</code>\n\n"
+                "Доступные: драма, триллер, комедия, фантастика, ужасы, мелодрама, "
+                "детектив, боевик, фэнтези, криминал, мультфильм, биография, история",
+                parse_mode="HTML",
+            )
+            return
+        genre = parts[1].strip().lower()
+        await message.bot.send_chat_action(message.chat.id, action="typing")
+        try:
+            # Сначала пробуем как сериалы — пара же смотрит сериалы. Если пусто — фильмы.
+            hits = await kp.get_top_by_genre(genre, is_series=True, limit=10)
+            if not hits:
+                hits = await kp.get_top_by_genre(genre, limit=10)
+        except Exception as e:
+            await message.answer(f"😕 KP заглох: {e}")
+            return
+        if not hits:
+            await message.answer(
+                f"🤷 По жанру «{genre}» ничего не нашёл. Проверь написание.",
+            )
+            return
+
+        async with session_factory() as session:
+            user = await repo.get_or_create_user(
+                session, tg_id=message.from_user.id,
+                username=message.from_user.username, full_name=message.from_user.full_name,
+            )
+            my_rows = await repo.list_user_series(session, user.id, status=None)
+            known_kp_ids = {s.kp_id for _, s in my_rows}
+
+        from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+        lines = [f"📊 <b>Топ-{len(hits)} по жанру «{genre}»:</b>", ""]
+        for i, h in enumerate(hits, 1):
+            year_str = f" ({h.year})" if h.year else ""
+            rating_str = f" ⭐{h.rating_kp:.1f}" if h.rating_kp else ""
+            mark = " ✅" if h.kp_id in known_kp_ids else ""
+            marker = DIGIT_EMOJI[i - 1] if i <= len(DIGIT_EMOJI) else f"{i}."
+            lines.append(f"{marker} <b>{h.title_ru}</b>{year_str}{rating_str}{mark}")
+
+        media = [InputMediaPhoto(media=h.poster_url) for h in hits if h.poster_url]
+        if len(media) >= 2:
+            try:
+                await message.bot.send_media_group(message.chat.id, media[:10])
+            except Exception:
+                pass
+
+        rows: list[list] = []
+        cur: list = []
+        for i, h in enumerate(hits, 1):
+            if h.kp_id in known_kp_ids:
+                continue  # уже добавлено, не предлагаем
+            short = h.title_ru[:18] + "…" if len(h.title_ru) > 18 else h.title_ru
+            cur.append(IKB(text=f"➕ {i}. {short}", callback_data=f"addkp:{h.kp_id}"))
+            if len(cur) >= 2:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+        if not rows:
+            lines.append("")
+            lines.append("<i>Все уже в твоих списках ✅</i>")
+
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=IKM(inline_keyboard=rows) if rows else None,
+            disable_web_page_preview=True,
+        )
+
     @router.message(F.text == "🎲 Что включить?")
     async def btn_today(message: Message) -> None:
         await cmd_today(message)

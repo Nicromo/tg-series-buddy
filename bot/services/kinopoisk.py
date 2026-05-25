@@ -231,6 +231,43 @@ class KinopoiskClient:
 
     # ---------- Детали ----------
 
+    async def get_top_by_genre(
+        self, genre: str, *, is_series: Optional[bool] = None, limit: int = 10,
+    ) -> list[KPSearchHit]:
+        """Топ фильмов/сериалов по жанру, сортировка по rating.kp DESC."""
+        params: dict[str, str] = {
+            "limit": str(limit),
+            "page": "1",
+            "sortField": "rating.kp",
+            "sortType": "-1",
+            "genres.name": genre,
+            "rating.kp": "7-10",  # отсекаем низкорейтинговые
+        }
+        if is_series is True:
+            params["isSeries"] = "true"
+        elif is_series is False:
+            params["isSeries"] = "false"
+        try:
+            resp = await self._client.get("/movie", params=params)
+            resp.raise_for_status()
+            docs = resp.json().get("docs", [])
+        except Exception:
+            return []
+        hits: list[KPSearchHit] = []
+        for d in docs:
+            poster = (d.get("poster") or {}).get("url") or (d.get("poster") or {}).get("previewUrl")
+            rating_kp = (d.get("rating") or {}).get("kp")
+            hits.append(KPSearchHit(
+                kp_id=int(d["id"]),
+                title_ru=d.get("name") or d.get("alternativeName") or "?",
+                title_en=d.get("alternativeName"),
+                year=d.get("year"),
+                poster_url=poster,
+                short_description=d.get("shortDescription") or d.get("description"),
+                rating_kp=float(rating_kp) if rating_kp else None,
+            ))
+        return hits
+
     async def get_seasons(self, kp_id: int) -> list[KPSeason]:
         """Возвращает список сезонов с эпизодами и датами выхода.
         Для продолжающихся сериалов даты эпизодов могут быть в будущем

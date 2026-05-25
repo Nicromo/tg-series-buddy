@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from ..db import repository as repo
 from ..keyboards.series_kb import checkin_keyboard
 from .kinopoisk import KinopoiskClient
-from .season_watcher import check_new_seasons
+from .season_watcher import check_new_seasons, check_today_episodes
 from .youtube_rss import fetch_latest_videos
 
 logger = logging.getLogger(__name__)
@@ -133,6 +133,16 @@ def start_scheduler(bot: Bot, session_factory: async_sessionmaker, kp: Kinopoisk
             coalesce=True,
             misfire_grace_time=3600,
         )
+        # Ежедневно в 18:00 UTC (~21:00 МСК) — пуш о вышедших сегодня сериях
+        scheduler.add_job(
+            check_today_episodes,
+            trigger=CronTrigger(hour=18, minute=0),
+            args=[bot, session_factory, kp],
+            id="today_episodes",
+            replace_existing=True,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
     # Каждый час (в xx:17) — проверка YouTube подписок
     scheduler.add_job(
         check_youtube_subscriptions,
@@ -145,6 +155,7 @@ def start_scheduler(bot: Bot, session_factory: async_sessionmaker, kp: Kinopoisk
     )
     scheduler.start()
     logger.info(
-        "Scheduler: weekly_checkin Sun 19:00 + season_watcher Mon 09:00 + youtube_subs hourly",
+        "Scheduler: weekly_checkin Sun 19:00 + season_watcher Mon 09:00 "
+        "+ today_episodes daily 18:00 + youtube_subs hourly",
     )
     return scheduler
