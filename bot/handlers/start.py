@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import os
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -260,9 +261,11 @@ def make_router(session_factory: async_sessionmaker) -> Router:
         if not group:
             return
         title, items = group
-        lines = [f"<b>{title}</b>", ""]
+        lines = [f"<b>{html.escape(title)}</b>", ""]
         for cmd, desc in items:
-            lines.append(f"<code>{cmd}</code> — {desc}")
+            # html.escape — иначе угловые скобки в `/find <запрос>` и `/top <жанр>`
+            # ломают HTML parse mode и edit_text падает (а bare except скрывает)
+            lines.append(f"<code>{html.escape(cmd)}</code> — {html.escape(desc)}")
         try:
             await call.message.edit_text(
                 "\n".join(lines),
