@@ -35,8 +35,8 @@ async def init_db(engine) -> None:
         await conn.run_sync(Base.metadata.create_all)
         # Best-effort migration (works on both SQLite and Postgres)
         for sql in [
-            "ALTER TABLE user_series ADD COLUMN last_checkin_at TIMESTAMP",
-            "ALTER TABLE series ADD COLUMN watch_options_json TEXT",
+            "ALTER TABLE user_series ADD COLUMN IF NOT EXISTS last_checkin_at TIMESTAMP",
+            "ALTER TABLE series ADD COLUMN IF NOT EXISTS watch_options_json TEXT",
         ]:
             try:
                 await conn.exec_driver_sql(sql)
