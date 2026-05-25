@@ -65,6 +65,8 @@ class Series(Base):
     rating_imdb: Mapped[Optional[float]] = mapped_column(nullable=True)
     seasons: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     status_kp: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # True если сериал (для решения показывать ли кнопку «Сезоны и серии»)
+    is_series: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     trailer_youtube_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     trailer_file_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)

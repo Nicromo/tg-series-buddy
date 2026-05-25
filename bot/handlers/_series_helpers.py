@@ -155,6 +155,7 @@ async def send_card(
         is_in_list=in_list,
         notify_releases=notify_releases,
         is_watching=user_status == "watching",
+        is_series=bool(getattr(series, "is_series", True)),
     )
     if series.poster_url:
         try:
@@ -190,6 +191,7 @@ def details_to_series_dict(d: KPDetails) -> dict:
         "watch_options_json": json.dumps(d.watch_options) if d.watch_options else None,
         "premiere_world": d.premiere_world,
         "premiere_russia": d.premiere_russia,
+        "is_series": d.is_series,
     }
 
 

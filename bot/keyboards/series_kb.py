@@ -13,6 +13,7 @@ def card_keyboard(
     is_in_list: bool = False,
     notify_releases: bool = False,
     is_watching: bool = False,
+    is_series: bool = False,
 ) -> InlineKeyboardMarkup:
     """Кнопки под карточкой сериала.
 
@@ -51,7 +52,13 @@ def card_keyboard(
     # Прогресс серий — только когда смотрим
     if is_watching:
         rows.append(
-            [InlineKeyboardButton(text="📺 Прогресс серий", callback_data=f"prog:{series_id}")]
+            [InlineKeyboardButton(text="📺 Мой прогресс серий", callback_data=f"prog:{series_id}")]
+        )
+
+    # Расписание сезонов — для сериалов (KP отдаёт даты выхода эпизодов)
+    if is_series:
+        rows.append(
+            [InlineKeyboardButton(text="🎞 Сезоны и серии", callback_data=f"seasons:{series_id}")]
         )
 
     # Кнопка трейлера ВСЕГДА — если YouTube-id нет, фолбэк на TG-канал

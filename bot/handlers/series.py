@@ -532,6 +532,86 @@ def make_router(
             reply_markup=_progress_keyboard(series_id, text),
         )
 
+    # ============== Сезоны и серии (seasons:) ==============
+    def _parse_dmy(date_str: Optional[str]) -> Optional[tuple[int, int, int]]:
+        """«17.01.2025» → (2025, 1, 17). Иначе None."""
+        if not date_str:
+            return None
+        try:
+            d, m, y = date_str.split(".")
+            return int(y), int(m), int(d)
+        except Exception:
+            return None
+
+    @router.callback_query(F.data.startswith("seasons:"))
+    async def cb_seasons(call: CallbackQuery) -> None:
+        series_id = int(call.data.split(":")[1])
+        async with session_factory() as session:
+            series = await session.get(Series, series_id)
+            if series is None or not getattr(series, "is_series", True):
+                await call.answer("Это не сериал — у фильмов нет сезонов")
+                return
+            kp_id = series.kp_id
+            title = series.title_ru
+        await call.answer("Загружаю расписание…")
+        await call.bot.send_chat_action(call.message.chat.id, action="typing")
+        try:
+            seasons = await kp.get_seasons(kp_id)
+        except Exception as e:
+            logger.exception("kp.get_seasons failed")
+            await call.message.answer(f"😕 Не получилось загрузить сезоны: {e}")
+            return
+        if not seasons:
+            await call.message.answer(
+                f"📺 У <b>{title}</b> у KP пока нет данных по сезонам.\n"
+                f"Возможно сериал ещё в производстве.",
+                parse_mode="HTML",
+            )
+            return
+
+        import datetime as _dt
+        today = _dt.date.today()
+        total_eps = sum(s.episodes_count or 0 for s in seasons)
+        future_count = 0
+        lines = [
+            f"🎞 <b>{title}</b> · {len(seasons)} сез. · {total_eps} серий",
+            "",
+        ]
+        # Полностью отображаем все сезоны, в каждом — до 8 серий (свежие)
+        for season in seasons:
+            head_bits = [f"<b>Сезон {season.number}</b>"]
+            if season.air_date:
+                head_bits.append(season.air_date.split(".")[-1])  # год
+            if season.episodes_count:
+                head_bits.append(f"{season.episodes_count} серий")
+            lines.append("🎬 " + " · ".join(head_bits))
+
+            eps = season.episodes
+            # Показываем сначала вышедшие, затем ещё не вышедшие. Лимит 8 чтобы caption не разорвался
+            shown = eps[-8:] if len(eps) > 8 else eps
+            if len(eps) > 8:
+                lines.append(f"  <i>… первые {len(eps) - 8} серий скрыто</i>")
+            for ep in shown:
+                tup = _parse_dmy(ep.air_date)
+                is_future = False
+                if tup:
+                    is_future = _dt.date(*tup) > today
+                    if is_future:
+                        future_count += 1
+                marker = "⏳" if is_future else "✅"
+                date_part = f" — {ep.air_date}" if ep.air_date else ""
+                name_part = f" «{ep.name}»" if ep.name else ""
+                lines.append(f"  {marker} E{ep.number}{name_part}{date_part}")
+            lines.append("")
+
+        if future_count > 0:
+            lines.append(f"⏳ <b>{future_count}</b> серий впереди — поставлю в подписку, нажми «🔔 Уведомлять» на карточке.")
+        # Telegram лимит сообщения 4096 — обрезаем если слишком длинно
+        text = "\n".join(lines)
+        if len(text) > 3900:
+            text = text[:3900] + "\n…(обрезано)"
+        await call.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+
     @router.callback_query(F.data.startswith("notify:"))
     async def cb_notify_toggle(call: CallbackQuery) -> None:
         series_id = int(call.data.split(":")[1])

@@ -32,6 +32,21 @@ class KPSearchHit:
 
 
 @dataclass
+class KPEpisode:
+    number: int
+    name: Optional[str]
+    air_date: Optional[str]  # "DD.MM.YYYY" или None
+
+
+@dataclass
+class KPSeason:
+    number: int
+    episodes_count: Optional[int]
+    air_date: Optional[str]  # "DD.MM.YYYY" дата начала сезона
+    episodes: list[KPEpisode]
+
+
+@dataclass
 class KPDetails:
     kp_id: int
     title_ru: str
@@ -215,6 +230,55 @@ class KinopoiskClient:
         return hits
 
     # ---------- Детали ----------
+
+    async def get_seasons(self, kp_id: int) -> list[KPSeason]:
+        """Возвращает список сезонов с эпизодами и датами выхода.
+        Для продолжающихся сериалов даты эпизодов могут быть в будущем
+        (KP знает расписание заранее).
+        """
+        try:
+            resp = await self._client.get(
+                "/season",
+                params={"movieId": str(kp_id), "limit": "50"},
+            )
+            if resp.status_code != 200:
+                return []
+            docs = resp.json().get("docs", []) or []
+        except Exception:
+            return []
+
+        def _fmt(iso: Optional[str]) -> Optional[str]:
+            if not iso:
+                return None
+            try:
+                y, m, dd = iso[:10].split("-")
+                return f"{dd}.{m}.{y}"
+            except Exception:
+                return None
+
+        seasons: list[KPSeason] = []
+        for d in docs:
+            num = d.get("number")
+            if not isinstance(num, int):
+                continue
+            episodes_raw = d.get("episodes") or []
+            episodes = [
+                KPEpisode(
+                    number=e.get("number") or i + 1,
+                    name=(e.get("name") or "").strip() or None,
+                    air_date=_fmt(e.get("airDate")),
+                )
+                for i, e in enumerate(episodes_raw)
+            ]
+            seasons.append(KPSeason(
+                number=num,
+                episodes_count=d.get("episodesCount") or len(episodes) or None,
+                air_date=_fmt(d.get("airDate")),
+                episodes=episodes,
+            ))
+        # KP возвращает сезоны в произвольном порядке — сортируем по номеру
+        seasons.sort(key=lambda s: s.number)
+        return seasons
 
     async def get_details(self, kp_id: int) -> KPDetails:
         resp = await self._client.get(f"/movie/{kp_id}")
