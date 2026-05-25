@@ -1,7 +1,15 @@
 """Генератор постера-картинки «Наша неделя» для шеринга.
 
-Принимает на вход список активных сериалов (max 5), скачивает с КП
-постеры и собирает PNG 1080×1350 (вертикальный формат для сторис).
+Делаем 1080×1350 (вертикальный, сторис-формат).
+
+КРИТИЧНО про шрифты: на Render (Linux slim) нет Windows-шрифтов,
+а ImageFont.load_default() не поддерживает кириллицу. Поэтому:
+1. В Dockerfile установлен пакет fonts-dejavu-core
+2. Здесь ищем DejaVuSans именно по Linux-путям
+
+Эмодзи в тексте НЕ используем — обычный TTF их не рендерит как
+цветные (Pillow без embedded_color не умеет цветные эмодзи).
+Вместо этого — текстовые подписи и геометрические бэйджи.
 """
 
 from __future__ import annotations
@@ -9,7 +17,6 @@ from __future__ import annotations
 import io
 import logging
 import os
-import random
 from typing import Optional
 
 import httpx
@@ -17,21 +24,33 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+# Шрифты в порядке предпочтения. На Render (после Dockerfile с
+# fonts-dejavu-core) сработает первый блок.
+_FONT_PATHS_REGULAR = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    r"C:\Windows\Fonts\segoeui.ttf",
+    r"C:\Windows\Fonts\arial.ttf",
+]
+_FONT_PATHS_BOLD = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    r"C:\Windows\Fonts\segoeuib.ttf",
+    r"C:\Windows\Fonts\arialbd.ttf",
+]
+
+
 def _font(size: int, bold: bool = False):
-    """Лучший доступный шрифт с поддержкой кириллицы."""
     from PIL import ImageFont
-    candidates = (
-        r"C:\Windows\Fonts\segoeuib.ttf" if bold else r"C:\Windows\Fonts\segoeui.ttf",
-        r"C:\Windows\Fonts\arialbd.ttf" if bold else r"C:\Windows\Fonts\arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans.ttf",
-    )
+    candidates = _FONT_PATHS_BOLD if bold else _FONT_PATHS_REGULAR
     for p in candidates:
         if p and os.path.exists(p):
             try:
                 return ImageFont.truetype(p, size)
             except Exception:
                 continue
+    logger.warning("No TTF font found — using bitmap default (cyrillic will break)")
     return ImageFont.load_default()
 
 
@@ -46,44 +65,68 @@ async def _fetch_poster_bytes(url: str) -> Optional[bytes]:
     return None
 
 
+_STATUS_TEXT = {
+    "▶️ Смотрим": "СМОТРИМ",
+    "👀 Хотим": "ХОТИМ",
+    "✅ Досмотрено": "ДОСМОТРЕЛИ",
+    "🔁 Пересмотр": "ПЕРЕСМОТР",
+}
+_STATUS_COLOR = {
+    "СМОТРИМ":    "#ff7eb3",
+    "ХОТИМ":      "#ffd86b",
+    "ДОСМОТРЕЛИ": "#9be36b",
+    "ПЕРЕСМОТР":  "#7cc6ff",
+}
+
+
+def _strip_emoji(status_label: str) -> tuple[str, str]:
+    """«▶️ Смотрим» → («СМОТРИМ», цвет)."""
+    label = _STATUS_TEXT.get(status_label, status_label)
+    color = _STATUS_COLOR.get(label, "#ffffff")
+    return label, color
+
+
 async def build_week_wallpaper(
-    items: list,  # list of (status_label, Series) — где status_label вроде "▶️ Смотрим"
+    items: list,
     *,
     bot_username: str = "dvoye_na_divane_bot",
     header: str = "Наша неделя",
 ) -> Optional[bytes]:
-    """Строит PNG 1080×1350. Возвращает bytes или None при ошибке."""
+    """Строит PNG 1080×1350. items = [(status_label, Series), ...]."""
     try:
         from PIL import Image, ImageDraw, ImageFilter
     except ImportError:
-        logger.warning("Pillow not installed — /wallpaper disabled")
+        logger.warning("Pillow not installed")
         return None
 
     W, H = 1080, 1350
-    img = Image.new("RGB", (W, H), "#0f0820")
+    img = Image.new("RGB", (W, H), "#120822")
     draw = ImageDraw.Draw(img)
 
-    # Градиент фона: тёмно-фиолетовый → тёмно-синий
+    # Тёмный градиент: фиолет → индиго
     for y in range(H):
         t = y / H
-        r = int(15 + (60 - 15) * t)
-        g = int(8 + (20 - 8) * t)
-        b = int(32 + (95 - 32) * t)
+        r = int(18 + (45 - 18) * t)
+        g = int(8 + (15 - 8) * t)
+        b = int(34 + (85 - 34) * t)
         draw.line([(0, y), (W, y)], fill=(r, g, b))
 
-    # Заголовки
-    draw.text((W // 2, 80), "🛋 Диванные критики", font=_font(48, bold=True), anchor="mm", fill="#ffd86b")
-    draw.text((W // 2, 155), header, font=_font(64, bold=True), anchor="mm", fill="#fff")
-    sub = f"{len(items)} тайтлов · общий список с партнёром" if items else ""
-    if sub:
-        draw.text((W // 2, 215), sub, font=_font(28), anchor="mm", fill="#bba")
+    # Шапка: бренд (без эмодзи в тексте — оно не рендерится)
+    draw.text((W // 2, 80), "DIVANNYE KRITIKI", font=_font(36, bold=True), anchor="mm", fill="#ffd86b")
+    # Декоративная линия под брендом
+    draw.line([(W // 2 - 220, 110), (W // 2 + 220, 110)], fill="#ffd86b", width=2)
+    # Большой заголовок
+    draw.text((W // 2, 175), header.upper(), font=_font(80, bold=True), anchor="mm", fill="#ffffff")
 
     if not items:
-        draw.text((W // 2, H // 2), "Список пуст 🤷", font=_font(64), anchor="mm", fill="#fff")
-        draw.text((W // 2, H - 60), f"@{bot_username}", font=_font(28), anchor="mm", fill="#888")
+        draw.text((W // 2, H // 2), "Список пуст", font=_font(48), anchor="mm", fill="#aaa")
+        draw.text((W // 2, H - 60), f"@{bot_username}", font=_font(26), anchor="mm", fill="#888")
         buf = io.BytesIO()
         img.save(buf, "PNG", optimize=True)
         return buf.getvalue()
+
+    sub = f"{len(items)} тайтлов — общий список с партнёром"
+    draw.text((W // 2, 235), sub, font=_font(28), anchor="mm", fill="#c8c0e0")
 
     # Скачиваем постеры параллельно
     import asyncio
@@ -92,50 +135,65 @@ async def build_week_wallpaper(
         for _, s in items[:5]
     ))
 
-    # Главный постер сверху по центру, ниже до 4 мелких
-    main_idx = 0
+    # Главный постер
     main_pb = poster_bytes[0] if poster_bytes else None
+    main_y_top = 300
+    main_h = 0
     if main_pb:
         try:
             main_im = Image.open(io.BytesIO(main_pb)).convert("RGB")
-            ratio = 340 / main_im.width
-            mw = int(main_im.width * ratio)
+            target_w = 360
+            ratio = target_w / main_im.width
+            mw = target_w
             mh = int(main_im.height * ratio)
             main_im = main_im.resize((mw, mh))
             # Тень
-            shadow = Image.new("RGBA", (mw + 40, mh + 40), (0, 0, 0, 0))
+            shadow = Image.new("RGBA", (mw + 50, mh + 50), (0, 0, 0, 0))
             sd = ImageDraw.Draw(shadow)
-            sd.rounded_rectangle([20, 20, mw + 20, mh + 20], 18, fill=(0, 0, 0, 160))
-            shadow = shadow.filter(ImageFilter.GaussianBlur(10))
-            img.paste(shadow, ((W - mw - 40) // 2, 260 - 20), shadow)
+            sd.rounded_rectangle([25, 25, mw + 25, mh + 25], 20, fill=(0, 0, 0, 180))
+            shadow = shadow.filter(ImageFilter.GaussianBlur(12))
+            img.paste(shadow, ((W - mw - 50) // 2, main_y_top - 25), shadow)
             mask = Image.new("L", (mw, mh), 0)
-            ImageDraw.Draw(mask).rounded_rectangle([0, 0, mw, mh], 18, fill=255)
-            img.paste(main_im, ((W - mw) // 2, 260), mask)
-            # Подпись главного
-            status, s = items[0]
-            draw.text(
-                (W // 2, 260 + mh + 30),
-                f"{status} · {s.title_ru}",
-                font=_font(30, bold=True), anchor="mm", fill="#fff",
-            )
+            ImageDraw.Draw(mask).rounded_rectangle([0, 0, mw, mh], 20, fill=255)
+            img.paste(main_im, ((W - mw) // 2, main_y_top), mask)
+
+            # Бейдж со статусом (цветная плашка вместо эмодзи в тексте)
+            status_label, status_color = _strip_emoji(items[0][0])
+            badge_text = status_label
+            f_badge = _font(26, bold=True)
+            tbox = draw.textbbox((0, 0), badge_text, font=f_badge)
+            tw = tbox[2] - tbox[0]
+            th = tbox[3] - tbox[1]
+            pad_x, pad_y = 24, 12
+            bw = tw + pad_x * 2
+            bh = th + pad_y * 2
+            bx = (W - bw) // 2
+            by = main_y_top + mh + 25
+            draw.rounded_rectangle([bx, by, bx + bw, by + bh], 18, fill=status_color)
+            draw.text((W // 2, by + bh // 2), badge_text, font=f_badge, anchor="mm", fill="#1a0e30")
+
+            # Название под бейджем
+            title = items[0][1].title_ru or ""
+            if len(title) > 28:
+                title = title[:28] + "…"
+            draw.text((W // 2, by + bh + 30), title, font=_font(32, bold=True), anchor="mm", fill="#ffffff")
+            main_h = mh + bh + 100
         except Exception as e:
             logger.warning("main poster paste failed: %s", e)
-            mh = 0
-    else:
-        mh = 0
 
-    # 4 мелких в сетке 2×2
-    grid_top = 260 + (mh if mh else 360) + 100
-    cell_w = 240
-    cell_h = 360
-    gap = 30
-    total_w = cell_w * 2 + gap
+    # 4 мелких в сетке 2×2 — постер + цветная плашка статуса + название
+    grid_top = main_y_top + (main_h if main_h else 460) + 20
+    cell_w = 220
+    cell_h = 330
+    gap_x = 40
+    gap_y = 100
+    total_w = cell_w * 2 + gap_x
     start_x = (W - total_w) // 2
     for i in range(1, min(5, len(items))):
         col = (i - 1) % 2
         row = (i - 1) // 2
-        x = start_x + col * (cell_w + gap)
-        y = grid_top + row * (cell_h + 80)
+        x = start_x + col * (cell_w + gap_x)
+        y = grid_top + row * (cell_h + gap_y)
         pb = poster_bytes[i] if i < len(poster_bytes) else None
         if pb:
             try:
@@ -153,16 +211,29 @@ async def build_week_wallpaper(
                 img.paste(small, (x + (cell_w - pw) // 2, y), mask)
             except Exception as e:
                 logger.warning("small poster paste failed: %s", e)
-        status, s = items[i]
-        # Подпись
-        draw.text((x + cell_w // 2, y + cell_h + 20), status, font=_font(22, bold=True), anchor="mm", fill="#ffd86b")
-        title = (s.title_ru or "")[:22]
-        if len((s.title_ru or "")) > 22:
-            title += "…"
-        draw.text((x + cell_w // 2, y + cell_h + 50), title, font=_font(20), anchor="mm", fill="#dde")
+
+        status_label, status_color = _strip_emoji(items[i][0])
+        # Плашка статуса
+        f_st = _font(18, bold=True)
+        tbox = draw.textbbox((0, 0), status_label, font=f_st)
+        tw = tbox[2] - tbox[0]
+        th = tbox[3] - tbox[1]
+        pad_x, pad_y = 14, 7
+        bw = tw + pad_x * 2
+        bh = th + pad_y * 2
+        bx = x + (cell_w - bw) // 2
+        by = y + cell_h + 14
+        draw.rounded_rectangle([bx, by, bx + bw, by + bh], 12, fill=status_color)
+        draw.text((x + cell_w // 2, by + bh // 2), status_label, font=f_st, anchor="mm", fill="#1a0e30")
+
+        title = items[i][1].title_ru or ""
+        if len(title) > 20:
+            title = title[:20] + "…"
+        draw.text((x + cell_w // 2, by + bh + 24), title, font=_font(20, bold=True), anchor="mm", fill="#ffffff")
 
     # Футер
-    draw.text((W // 2, H - 50), f"@{bot_username}", font=_font(26), anchor="mm", fill="#888")
+    draw.line([(W // 2 - 220, H - 80), (W // 2 + 220, H - 80)], fill="#ffd86b", width=1)
+    draw.text((W // 2, H - 50), f"@{bot_username}", font=_font(26, bold=True), anchor="mm", fill="#ffd86b")
 
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)
