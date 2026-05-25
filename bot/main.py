@@ -23,23 +23,15 @@ from .services.scheduler import start_scheduler
 
 
 BOT_COMMANDS = [
-    BotCommand(command="start", description="🚀 Запустить бота"),
-    BotCommand(command="add", description="🎬 Добавить сериал"),
-    BotCommand(command="today", description="🍿 Что включить сегодня"),
-    BotCommand(command="list", description="👀 Что хотим посмотреть"),
+    BotCommand(command="today",    description="🍿 Что смотреть сегодня"),
+    BotCommand(command="add",      description="➕ Добавить сериал или фильм"),
+    BotCommand(command="list",     description="📋 Хочу посмотреть"),
     BotCommand(command="watching", description="▶️ Смотрим сейчас"),
-    BotCommand(command="watched", description="✅ Досмотренные"),
-    BotCommand(command="rewatch", description="🔁 Хотим пересмотреть"),
-    BotCommand(command="random", description="🎲 Случайный из очереди"),
-    BotCommand(command="match", description="💛 Что лайкнули вы оба"),
-    BotCommand(command="suggest", description="✨ Подбор от ИИ"),
-    BotCommand(command="swipe", description="🃏 Свайп-вечер"),
-    BotCommand(command="find", description="🔎 Поиск в моих сериалах"),
-    BotCommand(command="stats", description="📊 Статистика"),
-    BotCommand(command="checkin", description="🔔 Спросить про активные"),
-    BotCommand(command="pair", description="👫 Пара / инвайт-код"),
-    BotCommand(command="menu", description="🧭 Показать меню"),
-    BotCommand(command="help", description="ℹ️ Справка"),
+    BotCommand(command="match",    description="💛 Нравится обоим"),
+    BotCommand(command="suggest",  description="🪄 Подбор от ИИ"),
+    BotCommand(command="swipe",    description="🃏 Свайп-вечер"),
+    BotCommand(command="stats",    description="📊 Статистика"),
+    BotCommand(command="menu",     description="✨ Главное меню"),
 ]
 
 
