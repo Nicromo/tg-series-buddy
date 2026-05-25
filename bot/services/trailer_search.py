@@ -45,20 +45,27 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-# Публичные Piped инстансы — порядок: чаще онлайн первыми
+# Публичные Piped инстансы — порядок: чаще онлайн первыми.
+# Списки устаревают — если все падают, актуальные см. на piped-instances.kavin.rocks
 PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.adminforge.de",
     "https://api.piped.privacydev.net",
     "https://pipedapi.r4fo.com",
+    "https://pipedapi.darkness.services",
+    "https://pipedapi.in.projectsegfau.lt",
+    "https://piapi.ggtyler.dev",
 ]
 
-# Invidious — аналог Piped, ещё больше публичных инстансов
+# Invidious — аналог Piped. Актуальный список: api.invidious.io
 INVIDIOUS_INSTANCES = [
     "https://invidious.privacyredirect.com",
     "https://yewtu.be",
     "https://invidious.nerdvpn.de",
     "https://inv.nadeko.net",
+    "https://invidious.f5.si",
+    "https://invidious.materialio.us",
+    "https://iv.melmac.space",
 ]
 
 # User-Agent — DuckDuckGo HTML банит default httpx
@@ -248,7 +255,11 @@ class TrailerFinder:
 
     async def from_piped(self, *, title: str, year: Optional[int]) -> Optional[str]:
         q = _ru_query(title, year)
-        async with httpx.AsyncClient(timeout=self._timeout) as c:
+        async with httpx.AsyncClient(
+            timeout=self._timeout,
+            follow_redirects=True,
+            headers={"User-Agent": UA_BROWSER},
+        ) as c:
             for instance in PIPED_INSTANCES:
                 try:
                     r = await c.get(
@@ -272,7 +283,11 @@ class TrailerFinder:
 
     async def from_invidious(self, *, title: str, year: Optional[int]) -> Optional[str]:
         q = _ru_query(title, year)
-        async with httpx.AsyncClient(timeout=self._timeout) as c:
+        async with httpx.AsyncClient(
+            timeout=self._timeout,
+            follow_redirects=True,
+            headers={"User-Agent": UA_BROWSER},
+        ) as c:
             for instance in INVIDIOUS_INSTANCES:
                 try:
                     r = await c.get(
@@ -293,41 +308,58 @@ class TrailerFinder:
 
     # ---------- Источник 5: DuckDuckGo HTML (без ключа) ----------
 
-    async def from_duckduckgo(self, *, title: str, year: Optional[int]) -> Optional[str]:
-        """HTML парсинг DDG. Ищет «<title> русский трейлер» + site:youtube.com
-        и достаёт первый YouTube videoId из ссылок."""
-        q = _ru_query(title, year) + " site:youtube.com"
-        try:
-            async with httpx.AsyncClient(
-                timeout=self._timeout,
-                headers={"User-Agent": UA_BROWSER},
-                follow_redirects=True,
-            ) as c:
-                r = await c.post(
-                    "https://html.duckduckgo.com/html/",
-                    data={"q": q},
-                )
-                if r.status_code != 200:
-                    logger.warning("DDG status %s", r.status_code)
-                    return None
-                # DDG оборачивает результаты в href=/l/?uddg=<encoded>...
-                # Достаём YouTube id и из прямых, и из обёрнутых URL.
-                html = r.text
-                # Прямой /watch?v=ID
-                m = re.search(r"youtube\.com%2Fwatch%3Fv%3D([A-Za-z0-9_-]{11})", html)
-                if m:
-                    return m.group(1)
-                m = re.search(r"youtube\.com/watch\?v=([A-Za-z0-9_-]{11})", html)
-                if m:
-                    return m.group(1)
-                m = re.search(r"youtu\.be%2F([A-Za-z0-9_-]{11})", html)
-                if m:
-                    return m.group(1)
-                m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", html)
-                if m:
-                    return m.group(1)
-        except Exception as e:
-            logger.warning("DDG failed: %s", e)
+    async def _ddg_one(self, q: str) -> Optional[str]:
+        """Один запрос к DDG HTML. Пытается извлечь YouTube id."""
+        async with httpx.AsyncClient(
+            timeout=self._timeout,
+            headers={"User-Agent": UA_BROWSER},
+            follow_redirects=True,
+        ) as c:
+            r = await c.post("https://html.duckduckgo.com/html/", data={"q": q})
+        if r.status_code != 200:
+            logger.warning("DDG status %s for q=%r", r.status_code, q[:80])
+            return None
+        html = r.text
+        # Прямой и url-encoded варианты
+        patterns = [
+            r"youtube\.com%2Fwatch%3Fv%3D([A-Za-z0-9_-]{11})",
+            r"youtube\.com/watch\?v=([A-Za-z0-9_-]{11})",
+            r"youtu\.be%2F([A-Za-z0-9_-]{11})",
+            r"youtu\.be/([A-Za-z0-9_-]{11})",
+        ]
+        for p in patterns:
+            m = re.search(p, html)
+            if m:
+                return m.group(1)
+        return None
+
+    async def from_duckduckgo(
+        self,
+        *,
+        title: str,
+        year: Optional[int],
+        title_en: Optional[str] = None,
+    ) -> Optional[str]:
+        """HTML парсинг DDG. Пробует несколько вариантов запроса:
+        1. <title_ru> русский трейлер <year> site:youtube.com
+        2. <title_en> trailer <year> site:youtube.com  (если есть title_en)
+        3. <title_ru> trailer <year>  (без site: — менее точно)
+        """
+        queries = [_ru_query(title, year) + " site:youtube.com"]
+        if title_en and title_en != title:
+            en_q = f"{title_en} trailer"
+            if year:
+                en_q += f" {year}"
+            queries.append(en_q + " site:youtube.com")
+        queries.append(_ru_query(title, year))  # без site: фильтра
+
+        for q in queries:
+            try:
+                yt_id = await self._ddg_one(q)
+                if yt_id:
+                    return yt_id
+            except Exception as e:
+                logger.warning("DDG query failed (%s): %s", q[:50], e)
         return None
 
     # ---------- Главный метод ----------
@@ -337,6 +369,7 @@ class TrailerFinder:
         *,
         title: str,
         year: Optional[int] = None,
+        title_en: Optional[str] = None,
         imdb_id: Optional[str] = None,
         tmdb_id: Optional[int] = None,
         is_series: bool = True,
@@ -344,7 +377,10 @@ class TrailerFinder:
     ) -> Optional[str]:
         """Возвращает YouTube id или None.
 
-        Порядок: уже знаем из KP → TMDB → YouTube Data API → Piped.
+        Порядок: уже знаем из KP → TMDB → YouTube Data API → Piped →
+        Invidious → DuckDuckGo (для каждого keyless источника пробуем
+        ещё и title_en если он есть — KP плохо ищет по русским
+        транслитерациям вроде «Молодой Шерлок»).
         """
         if kp_trailer_youtube_id:
             return kp_trailer_youtube_id
@@ -364,35 +400,38 @@ class TrailerFinder:
 
         # 2. YouTube Data API
         if self._yt_key:
+            for q_title in (t for t in (title, title_en) if t):
+                try:
+                    yt_id = await self.from_youtube_api(title=q_title, year=year)
+                    if yt_id:
+                        logger.info("Trailer for %s via YouTube API (%s): %s", title, q_title, yt_id)
+                        return yt_id
+                except Exception as e:
+                    logger.warning("YouTube API stage failed for %s: %s", q_title, e)
+
+        # 3. Piped — пробуем ru + en title
+        for q_title in (t for t in (title, title_en) if t):
             try:
-                yt_id = await self.from_youtube_api(title=title, year=year)
+                yt_id = await self.from_piped(title=q_title, year=year)
                 if yt_id:
-                    logger.info("Trailer for %s via YouTube API: %s", title, yt_id)
+                    logger.info("Trailer for %s via Piped (%s): %s", title, q_title, yt_id)
                     return yt_id
             except Exception as e:
-                logger.warning("YouTube API stage failed: %s", e)
+                logger.warning("Piped stage failed for %s: %s", q_title, e)
 
-        # 3. Piped
-        try:
-            yt_id = await self.from_piped(title=title, year=year)
-            if yt_id:
-                logger.info("Trailer for %s via Piped: %s", title, yt_id)
-                return yt_id
-        except Exception as e:
-            logger.warning("Piped stage failed: %s", e)
+        # 4. Invidious — пробуем ru + en title
+        for q_title in (t for t in (title, title_en) if t):
+            try:
+                yt_id = await self.from_invidious(title=q_title, year=year)
+                if yt_id:
+                    logger.info("Trailer for %s via Invidious (%s): %s", title, q_title, yt_id)
+                    return yt_id
+            except Exception as e:
+                logger.warning("Invidious stage failed for %s: %s", q_title, e)
 
-        # 4. Invidious — другой набор инстансов
+        # 5. DuckDuckGo HTML — внутри сам пробует ru/en варианты
         try:
-            yt_id = await self.from_invidious(title=title, year=year)
-            if yt_id:
-                logger.info("Trailer for %s via Invidious: %s", title, yt_id)
-                return yt_id
-        except Exception as e:
-            logger.warning("Invidious stage failed: %s", e)
-
-        # 5. DuckDuckGo HTML search (последняя попытка получить точный videoId)
-        try:
-            yt_id = await self.from_duckduckgo(title=title, year=year)
+            yt_id = await self.from_duckduckgo(title=title, year=year, title_en=title_en)
             if yt_id:
                 logger.info("Trailer for %s via DuckDuckGo: %s", title, yt_id)
                 return yt_id

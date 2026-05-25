@@ -462,6 +462,7 @@ def make_router(
                     await session.commit()
             yt_id = series.trailer_youtube_id
             title = series.title_ru
+            title_en = series.title_en
             year = series.year
             trailer_lang = series.trailer_language
             kp_id = series.kp_id
@@ -494,7 +495,8 @@ def make_router(
         if not yt_id:
             try:
                 yt_id = await trailer_finder.find(
-                    title=title, year=year, imdb_id=imdb_id, tmdb_id=tmdb_id,
+                    title=title, year=year, title_en=title_en,
+                    imdb_id=imdb_id, tmdb_id=tmdb_id,
                     is_series=is_series_flag,
                 )
             except Exception as e:
@@ -563,7 +565,7 @@ def make_router(
         if not yt_id:
             try:
                 yt_id = await trailer_finder.find(
-                    title=title, year=year,
+                    title=title, year=year, title_en=details.title_en,
                     imdb_id=details.imdb_id, tmdb_id=details.tmdb_id,
                     is_series=details.is_series,
                 )
