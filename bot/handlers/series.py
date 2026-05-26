@@ -1232,6 +1232,11 @@ def make_router(
         # 'date' по умолчанию: свежие добавления сверху
         return sorted(rows, key=lambda x: (x[0].updated_at or x[0].id), reverse=True)
 
+    # text_msg_id → [poster_msg_id, ...] для удаления при пагинации/сортировке.
+    # In-memory кеш, не критично если потеряется при рестарте — просто старые
+    # постеры останутся висеть.
+    _LIST_POSTER_IDS: dict[int, list[int]] = {}
+
     async def _render_list(
         bot: Bot,
         chat_id: int,
@@ -1240,7 +1245,11 @@ def make_router(
         *,
         page: int = 0,
         sort_key: str = "date",
+        replace_msg: Optional[Message] = None,
     ) -> None:
+        """Рендерит /list. Если replace_msg задан — удаляет его и связанные постеры
+        перед отправкой нового (так пагинация/сортировка не плодит сообщения).
+        """
         header, empty_msg = _HEADERS.get(status, ("Список", "Пусто."))
         async with session_factory() as session:
             user = await repo.get_or_create_user(session, tg_id=tg_user_id, username=None, full_name=None)
@@ -1248,6 +1257,20 @@ def make_router(
         if not rows:
             await bot.send_message(chat_id, empty_msg)
             return
+
+        # Удаляем старое сообщение со списком + постеры от предыдущего рендера
+        if replace_msg is not None:
+            old_id = replace_msg.message_id
+            old_posters = _LIST_POSTER_IDS.pop(old_id, [])
+            try:
+                await bot.delete_message(chat_id, old_id)
+            except Exception:
+                pass
+            for pid in old_posters:
+                try:
+                    await bot.delete_message(chat_id, pid)
+                except Exception:
+                    pass
 
         rows = _sort_rows(rows, sort_key)
         total = len(rows)
@@ -1258,11 +1281,14 @@ def make_router(
 
         from aiogram.types import InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
 
-        # Галерея постеров для текущей страницы
+        # Галерея постеров для текущей страницы — запоминаем их id, чтобы удалить
+        # при следующей пагинации
+        poster_msg_ids: list[int] = []
         media = [InputMediaPhoto(media=s.poster_url) for _, s in items if s.poster_url]
         if len(media) >= 2:
             try:
-                await bot.send_media_group(chat_id, media[:10])
+                sent = await bot.send_media_group(chat_id, media[:10])
+                poster_msg_ids = [m.message_id for m in sent]
             except Exception as e:
                 logger.warning("send_media_group failed for /%s page=%s: %s", status, page, e)
 
@@ -1326,13 +1352,20 @@ def make_router(
         if action_row:
             btn_rows.append(action_row)
 
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id,
             "\n".join(lines),
             parse_mode="HTML",
             reply_markup=IKM(inline_keyboard=btn_rows),
             disable_web_page_preview=True,
         )
+        # Запоминаем связку text_msg → постеры, чтобы удалять при пагинации
+        if poster_msg_ids:
+            _LIST_POSTER_IDS[sent.message_id] = poster_msg_ids
+            # Cap размер кеша — храним только последние 50 рендеров
+            if len(_LIST_POSTER_IDS) > 50:
+                oldest = next(iter(_LIST_POSTER_IDS))
+                _LIST_POSTER_IDS.pop(oldest, None)
 
     @router.callback_query(F.data.startswith("lp:"))
     async def cb_list_page(call: CallbackQuery) -> None:
@@ -1345,6 +1378,7 @@ def make_router(
         await _render_list(
             call.bot, call.message.chat.id, call.from_user.id, status,
             page=int(page_s), sort_key=sort_key,
+            replace_msg=call.message,
         )
 
     @router.callback_query(F.data.startswith("ls:"))
@@ -1354,6 +1388,7 @@ def make_router(
         await _render_list(
             call.bot, call.message.chat.id, call.from_user.id, status,
             page=0, sort_key=sort_key,
+            replace_msg=call.message,
         )
 
     @router.message(Command("list"))
